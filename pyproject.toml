@@ -1,0 +1,30 @@
+[project]
+name = "primejob"
+version = "0.1.0"
+description = "Internal CLI for running GPU training jobs on Prime Intellect"
+requires-python = ">=3.11"
+dependencies = [
+    "prime>=0.6.8",
+    "paramiko>=3.4",
+    "typer>=0.12",
+    "rich>=13",
+    "pathspec>=0.12",
+    "python-dotenv>=1",
+    "textual>=0.80",
+]
+
+[project.scripts]
+primejob = "primejob.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/primejob"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-textual-snapshot>=0.4",
+]

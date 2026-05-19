@@ -1,0 +1,308 @@
+"""paramiko-based SSH/SFTP client.
+
+The pod's SSH endpoint comes from PodStatus.ssh_connection (string of form
+`ssh user@host -p PORT` per Prime docs) or an object with explicit fields. We
+parse defensively to handle both.
+"""
+from __future__ import annotations
+
+import os
+import posixpath
+import re
+import shlex
+import stat
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterator
+
+import paramiko
+
+
+@dataclass
+class SshEndpoint:
+    host: str
+    port: int
+    user: str
+    key_path: Path | None = None  # None → paramiko tries default keys + agent
+
+    @classmethod
+    def parse(cls, raw: str | dict | object, key_path: Path | None = None) -> "SshEndpoint":
+        if raw is None:
+            raise ValueError("ssh_connection is None — pod may still be provisioning")
+
+        # Some providers return a one-element list, e.g. ["ubuntu@1.2.3.4"].
+        if isinstance(raw, (list, tuple)):
+            if not raw:
+                raise ValueError("ssh_connection list is empty — pod may still be provisioning")
+            return cls.parse(raw[0], key_path=key_path)
+
+        # Dict shape
+        if isinstance(raw, dict):
+            host = raw.get("host") or raw.get("ip")
+            port = int(raw.get("port") or 22)
+            user = raw.get("user") or raw.get("username") or "root"
+            if not host:
+                raise ValueError(f"ssh_connection dict missing host: {raw!r}")
+            return cls(host=host, port=port, user=user, key_path=key_path)
+
+        # String shape: e.g. "ssh root@1.2.3.4 -p 12345" or "root@1.2.3.4:12345"
+        if isinstance(raw, str):
+            s = raw.strip()
+            # Form: ssh user@host -p port
+            m = re.match(
+                r"^(?:ssh\s+)?(?P<user>[^@\s]+)@(?P<host>[^\s:]+)(?:\s+-p\s+(?P<port>\d+)|:(?P<port2>\d+))?",
+                s,
+            )
+            if m:
+                return cls(
+                    host=m.group("host"),
+                    port=int(m.group("port") or m.group("port2") or 22),
+                    user=m.group("user"),
+                    key_path=key_path,
+                )
+            raise ValueError(f"Could not parse ssh_connection string: {s!r}")
+
+        # Pydantic model with attributes
+        host = getattr(raw, "host", None) or getattr(raw, "ip", None)
+        port = int(getattr(raw, "port", None) or 22)
+        user = getattr(raw, "user", None) or getattr(raw, "username", None) or "root"
+        if host:
+            return cls(host=host, port=port, user=user, key_path=key_path)
+        raise ValueError(f"Unrecognized ssh_connection shape: {type(raw).__name__}")
+
+
+@dataclass
+class ExecResult:
+    exit_code: int
+    stdout: str
+    stderr: str
+
+    def check(self) -> "ExecResult":
+        if self.exit_code != 0:
+            raise RuntimeError(
+                f"Remote command failed (exit={self.exit_code}): {self.stderr or self.stdout}"
+            )
+        return self
+
+
+class SshClient:
+    """Context-managed paramiko SSH client with SFTP helpers."""
+
+    def __init__(
+        self,
+        endpoint: SshEndpoint,
+        *,
+        connect_timeout: float = 10.0,
+        retries: int = 6,
+        retry_delay: float = 5.0,
+    ) -> None:
+        self.endpoint = endpoint
+        self.connect_timeout = connect_timeout
+        self.retries = retries
+        self.retry_delay = retry_delay
+        self._client: paramiko.SSHClient | None = None
+        self._sftp: paramiko.SFTPClient | None = None
+
+    def __enter__(self) -> "SshClient":
+        self.connect()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def connect(self) -> None:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        last_exc: Exception | None = None
+        for attempt in range(self.retries):
+            try:
+                kwargs = dict(
+                    hostname=self.endpoint.host,
+                    port=self.endpoint.port,
+                    username=self.endpoint.user,
+                    timeout=self.connect_timeout,
+                    allow_agent=True,
+                    look_for_keys=True,
+                )
+                if self.endpoint.key_path:
+                    kwargs["key_filename"] = str(self.endpoint.key_path)
+                client.connect(**kwargs)
+                self._client = client
+                return
+            except (paramiko.SSHException, OSError) as e:
+                last_exc = e
+                if attempt < self.retries - 1:
+                    time.sleep(self.retry_delay)
+        raise RuntimeError(
+            f"SSH connect failed after {self.retries} attempts to "
+            f"{self.endpoint.user}@{self.endpoint.host}:{self.endpoint.port}: {last_exc}"
+        )
+
+    def close(self) -> None:
+        if self._sftp is not None:
+            try:
+                self._sftp.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._sftp = None
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._client = None
+
+    def _require(self) -> paramiko.SSHClient:
+        if self._client is None:
+            raise RuntimeError("SshClient not connected — use as a context manager or call .connect()")
+        return self._client
+
+    @property
+    def sftp(self) -> paramiko.SFTPClient:
+        if self._sftp is None:
+            self._sftp = self._require().open_sftp()
+        return self._sftp
+
+    def exec(self, cmd: str, *, env: dict[str, str] | None = None) -> ExecResult:
+        """Run a command, return (exit_code, stdout, stderr) when done."""
+        full_cmd = _with_env_prefix(cmd, env)
+        stdin, stdout, stderr = self._require().exec_command(full_cmd, get_pty=False)
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        code = stdout.channel.recv_exit_status()
+        return ExecResult(exit_code=code, stdout=out, stderr=err)
+
+    def exec_stream(
+        self,
+        cmd: str,
+        *,
+        env: dict[str, str] | None = None,
+        on_line: Callable[[str, str], None] | None = None,
+    ) -> int:
+        """Run a command and stream stdout/stderr line-by-line via callback.
+
+        on_line(stream_name, line) — stream_name in {'stdout', 'stderr'}.
+        Returns the remote exit code.
+        """
+        full_cmd = _with_env_prefix(cmd, env)
+        transport = self._require().get_transport()
+        if transport is None:
+            raise RuntimeError("No active SSH transport")
+        chan = transport.open_session()
+        chan.exec_command(full_cmd)
+        chan.set_combine_stderr(False)
+
+        stdout_buf = b""
+        stderr_buf = b""
+        while True:
+            done = chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready()
+            if chan.recv_ready():
+                stdout_buf += chan.recv(65536)
+                stdout_buf = _emit_lines(stdout_buf, "stdout", on_line)
+            if chan.recv_stderr_ready():
+                stderr_buf += chan.recv_stderr(65536)
+                stderr_buf = _emit_lines(stderr_buf, "stderr", on_line)
+            if done:
+                break
+            time.sleep(0.05)
+        # flush trailing partials
+        if stdout_buf and on_line:
+            on_line("stdout", stdout_buf.decode("utf-8", errors="replace"))
+        if stderr_buf and on_line:
+            on_line("stderr", stderr_buf.decode("utf-8", errors="replace"))
+        return chan.recv_exit_status()
+
+    def mkdir_p(self, remote_path: str) -> None:
+        parts = remote_path.strip("/").split("/")
+        cur = ""
+        for p in parts:
+            cur = f"{cur}/{p}" if cur else f"/{p}"
+            try:
+                self.sftp.stat(cur)
+            except FileNotFoundError:
+                self.sftp.mkdir(cur)
+
+    def upload(
+        self,
+        local_path: str | Path,
+        remote_path: str,
+        *,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> None:
+        local = Path(local_path)
+        if local.is_dir():
+            self._upload_dir(local, remote_path, progress=progress)
+        else:
+            parent = posixpath.dirname(remote_path)
+            if parent:
+                self.mkdir_p(parent)
+            self.sftp.put(str(local), remote_path, callback=progress)
+
+    def _upload_dir(self, local: Path, remote: str, progress=None) -> None:
+        self.mkdir_p(remote)
+        for entry in sorted(local.rglob("*")):
+            rel = entry.relative_to(local).as_posix()
+            target = posixpath.join(remote, rel)
+            if entry.is_dir():
+                self.mkdir_p(target)
+            else:
+                self.sftp.put(str(entry), target, callback=progress)
+
+    def download(
+        self,
+        remote_path: str,
+        local_path: str | Path,
+        *,
+        ignore_permission_denied: bool = False,
+    ) -> None:
+        """Recursive download. If remote is a directory, mirror it into local."""
+        local = Path(local_path)
+        try:
+            st = self.sftp.stat(remote_path)
+        except PermissionError:
+            if ignore_permission_denied:
+                return
+            raise
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(st.st_mode):
+            local.mkdir(parents=True, exist_ok=True)
+            try:
+                entries = self.sftp.listdir_attr(remote_path)
+            except PermissionError:
+                if ignore_permission_denied:
+                    return
+                raise
+            for entry in entries:
+                self.download(
+                    posixpath.join(remote_path, entry.filename),
+                    local / entry.filename,
+                    ignore_permission_denied=ignore_permission_denied,
+                )
+        else:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            self.sftp.get(remote_path, str(local))
+
+
+def exec_oneshot(endpoint: SshEndpoint, cmd: str, *, timeout: float = 10.0) -> ExecResult:
+    """Open a fresh SSH connection, run one command, close. Suitable for periodic
+    polling (e.g. nvidia-smi) where we don't want to share the main streaming channel."""
+    with SshClient(endpoint, connect_timeout=timeout, retries=2, retry_delay=1.0) as sh:
+        return sh.exec(cmd)
+
+
+def _emit_lines(buf: bytes, stream: str, cb: Callable[[str, str], None] | None) -> bytes:
+    if cb is None:
+        return b""
+    while b"\n" in buf:
+        line, _, buf = buf.partition(b"\n")
+        cb(stream, line.decode("utf-8", errors="replace"))
+    return buf
+
+
+def _with_env_prefix(cmd: str, env: dict[str, str] | None) -> str:
+    if not env:
+        return cmd
+    exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
+    return f"env {exports} sh -c {shlex.quote(cmd)}"

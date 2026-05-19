@@ -1,0 +1,151 @@
+/* primejob dashboard — minimalist black + orange accent (Prime Intellect feel) */
+
+Screen {
+    background: $background;
+}
+
+#header {
+    height: 3;
+    padding: 1 2;
+    background: $background;
+    border-bottom: solid $primary 20%;
+    color: $foreground;
+}
+
+#stepper {
+    height: 3;
+    padding: 1 2;
+    background: $background;
+    color: $foreground;
+}
+
+#meta {
+    height: 1;
+    padding: 0 2;
+    background: $background;
+    color: $foreground;
+}
+
+#gpus {
+    max-height: 12;
+    margin: 0 2;
+    background: $background;
+}
+
+#gpus.-hidden {
+    display: none;
+}
+
+#log {
+    background: $background;
+    margin: 1 2;
+}
+
+Footer {
+    background: $panel;
+    color: $foreground;
+}
+
+/* Modal styling */
+
+ModalScreen {
+    align: center middle;
+}
+
+.modal-box {
+    width: 64;
+    height: auto;
+    max-height: 20;
+    padding: 1 2;
+    background: $panel;
+    border: thick $primary;
+}
+
+.modal-box.-danger {
+    border: thick $error;
+}
+
+.modal-title {
+    text-style: bold;
+    margin-bottom: 1;
+    color: $accent;
+}
+
+.modal-box.-danger .modal-title {
+    color: $error;
+}
+
+.modal-detail {
+    margin: 0 0 1 0;
+    color: $foreground;
+}
+
+.modal-hint {
+    color: $foreground 60%;
+    text-style: italic;
+}
+
+/* Summary screen */
+
+#summary {
+    align: center middle;
+    background: $background;
+}
+
+.summary-card {
+    width: 80;
+    height: auto;
+    padding: 2 3;
+    background: $panel;
+    border: round $success;
+}
+
+.summary-card.-failed {
+    border: round $error;
+}
+
+.summary-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.summary-title.-ok {
+    color: $success;
+}
+
+.summary-title.-fail {
+    color: $error;
+}
+
+.summary-row {
+    color: $foreground;
+}
+
+.summary-error {
+    color: $error;
+    text-style: bold;
+    margin-top: 1;
+}
+
+.summary-error-line {
+    color: $error;
+}
+
+/* Help overlay */
+
+.help-box {
+    width: 70;
+    height: auto;
+    padding: 1 2;
+    background: $panel;
+    border: round $accent;
+}
+
+.help-row {
+    color: $foreground;
+}
+
+.help-key {
+    color: $accent;
+    text-style: bold;
+}

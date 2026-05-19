@@ -1,0 +1,16 @@
+.DS_Store
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ropeproject/
+.primejob/
+outputs/
+dist/
+build/
+*.egg-info/

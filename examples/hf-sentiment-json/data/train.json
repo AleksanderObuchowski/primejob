@@ -1,0 +1,14 @@
+[
+  {"text": "The onboarding was fast and the support team solved my issue.", "label": 1},
+  {"text": "This release made the product easier to use and more reliable.", "label": 1},
+  {"text": "Customers praised the clear pricing and smooth checkout.", "label": 1},
+  {"text": "The model response was accurate, concise and helpful.", "label": 1},
+  {"text": "The migration finished early and the dashboard feels faster.", "label": 1},
+  {"text": "The export tool saved hours of manual cleanup.", "label": 1},
+  {"text": "The app crashed twice and support never replied.", "label": 0},
+  {"text": "The new workflow is confusing and slower than before.", "label": 0},
+  {"text": "Customers complained about hidden fees and failed payments.", "label": 0},
+  {"text": "The model hallucinated details and ignored the request.", "label": 0},
+  {"text": "The migration broke reports and blocked the team.", "label": 0},
+  {"text": "The deployment failed and erased the cached reports.", "label": 0}
+]

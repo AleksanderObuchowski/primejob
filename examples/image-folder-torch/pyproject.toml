@@ -1,0 +1,11 @@
+[project]
+name = "primejob-image-folder-torch-example"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch>=2.10",
+]
+
+[tool.primejob]
+dataset_disk = "pj-image-folder"
+default_gpu = "CPU"
