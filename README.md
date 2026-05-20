@@ -9,6 +9,12 @@ uv add primejob   # or: uv pip install primejob
 primejob doctor   # verify auth, paramiko, SDK, prime CLI
 ```
 
+To install the latest version directly from GitHub:
+
+```bash
+uv add git+https://github.com/AleksanderObuchowski/primejob.git
+```
+
 `PRIME_API_KEY` is read from `.env` in cwd or from `~/.prime/config.json` (after `prime login` / `primejob login`).
 
 ## Configure
