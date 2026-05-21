@@ -97,7 +97,20 @@ def run_doctor() -> int:
             ssh_detail += f" ({ssh.fingerprint})"
         if ssh.ok:
             if ssh.registered is True:
-                table.add_row("ssh key", ok, f"{ssh_detail} — registered in Prime")
+                if ssh.is_primary is True:
+                    table.add_row(
+                        "ssh key",
+                        ok,
+                        f"{ssh_detail} — registered in Prime, primary (pod injection)",
+                    )
+                elif ssh.is_primary is False:
+                    table.add_row(
+                        "ssh key",
+                        "[yellow]warn[/yellow]",
+                        f"{ssh_detail} — registered but not primary; pods may reject SSH",
+                    )
+                else:
+                    table.add_row("ssh key", ok, f"{ssh_detail} — registered in Prime")
             elif ssh.registered is None:
                 table.add_row(
                     "ssh key",
@@ -317,6 +330,11 @@ def run(
         "--setup-ssh",
         help="Configure SSH key path and register with Prime before provisioning.",
     ),
+    skip_provider: list[str] = typer.Option(
+        [],
+        "--skip-provider",
+        help="Exclude provider from cheapest-pick (repeatable). Also see exclude_providers in pyproject.toml.",
+    ),
     plain: bool = typer.Option(False, "--plain", help="Force plain streaming output (no TUI)."),
     exit_on_finish: bool = typer.Option(False, "--exit-on-finish", help="In TUI mode, skip summary screen and exit immediately."),
 ) -> None:
@@ -342,6 +360,7 @@ def run(
         data_subdir=data_subdir,
         include_data=include_data,
         setup_ssh=setup_ssh,
+        skip_providers=skip_provider,
     )
 
     use_tui = sys.stdout.isatty() and not plain

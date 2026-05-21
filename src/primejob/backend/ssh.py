@@ -92,6 +92,7 @@ def wait_for_ssh_connect(
     auth_warmup_s: float = 300.0,
     pod_ready_monotonic: float | None = None,
     on_retry: SshRetryDetailCallback | None = None,
+    auth_failure_hint: str | None = None,
 ) -> paramiko.SSHClient:
     """Block until SSH accepts our key or timeouts expire.
 
@@ -128,9 +129,12 @@ def wait_for_ssh_connect(
             if elapsed_pod < auth_warmup_s:
                 detail = "auth_propagation"
             else:
+                hint = auth_failure_hint or (
+                    "Run `primejob doctor` to verify your SSH key is registered in Prime."
+                )
                 raise RuntimeError(
                     "SSH authentication failed after waiting for key propagation. "
-                    "Run `primejob doctor` to verify your SSH key is registered in Prime."
+                    f"{hint}"
                 ) from e
         except (paramiko.SSHException, OSError, TimeoutError) as e:
             last_exc = e

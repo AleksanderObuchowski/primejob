@@ -54,7 +54,7 @@ def test_wait_for_ssh_connect_raises_after_auth_warm_window(
 
     with (
         patch("primejob.backend.ssh.paramiko.SSHClient", mock_cls),
-        pytest.raises(RuntimeError, match="authentication failed"),
+        pytest.raises(RuntimeError, match="exclude_providers|skip-provider"),
     ):
         wait_for_ssh_connect(
             endpoint,
@@ -62,6 +62,10 @@ def test_wait_for_ssh_connect_raises_after_auth_warm_window(
             retry_delay_s=0.01,
             pod_ready_monotonic=1000.0,
             auth_warmup_s=300.0,
+            auth_failure_hint=(
+                "Try `--skip-provider`, set `[tool.primejob].exclude_providers`, "
+                "or pick a different `--country`."
+            ),
         )
 
 

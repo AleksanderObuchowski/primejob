@@ -33,6 +33,8 @@ class SshKeyStatus:
     key_readable: bool
     fingerprint: str | None
     registered: bool | None  # None when the API check could not run
+    is_primary: bool | None = None  # None when registration unknown or unmatched
+    matched_key_id: str | None = None
     error: str | None = None
 
     @property
@@ -44,6 +46,38 @@ class SshKeyStatus:
         if self.registered is False:
             return False
         return True
+
+
+def record_is_primary(record: dict) -> bool:
+    """Return whether a Prime ssh_keys API record is marked primary."""
+    for field in ("isPrimary", "is_primary"):
+        value = record.get(field)
+        if value is not None:
+            return bool(value)
+    return False
+
+
+def ssh_auth_failure_hint(status: SshKeyStatus, *, provider: str | None = None) -> str:
+    """Actionable hint when pod SSH auth fails after the propagation window."""
+    provider_bit = f" on provider {provider}" if provider else ""
+    if status.registered is False:
+        return (
+            "Run `primejob doctor` to verify your SSH key is registered in Prime, "
+            "or use `primejob run --setup-ssh`."
+        )
+    if status.registered is True and status.is_primary is False:
+        return (
+            "Your key is registered in Prime but not marked primary — pods receive "
+            "the primary key only. Run `primejob login --yes` or promote it in "
+            "https://app.primeintellect.ai/settings/ssh-keys"
+        )
+    base = (
+        f"Your key appears registered in Prime{provider_bit}, but this pod never "
+        "accepted it — Prime may not have injected your primary SSH key into the "
+        "provider VM. Try `--skip-provider`, set `[tool.primejob].exclude_providers`, "
+        "or pick a different `--country`. Run `primejob doctor` to confirm primary status."
+    )
+    return base
 
 
 def get_client() -> APIClient:
@@ -231,12 +265,20 @@ def check_ssh_key(client: APIClient | None = None) -> SshKeyStatus:
         )
 
     registered: bool | None = None
+    is_primary: bool | None = None
+    matched_key_id: str | None = None
     api_error: str | None = None
     if client is not None:
         try:
             keys = list_registered_ssh_keys(client)
-            registered = _key_registered(normalized, fingerprint, keys)
-            if not registered:
+            match = matching_ssh_key_record(keys, normalized, fingerprint)
+            registered = match is not None
+            if match is not None:
+                is_primary = record_is_primary(match)
+                key_id = match.get("id")
+                if key_id is not None:
+                    matched_key_id = str(key_id)
+            elif not registered:
                 api_error = (
                     f"Public key {fingerprint} is not registered in your Prime account. "
                     "Run `primejob login` to upload it via the API, or add it in "
@@ -252,8 +294,18 @@ def check_ssh_key(client: APIClient | None = None) -> SshKeyStatus:
         key_readable=True,
         fingerprint=fingerprint,
         registered=registered,
+        is_primary=is_primary,
+        matched_key_id=matched_key_id,
         error=api_error,
     )
+
+
+def resolve_pod_ssh_key_id(client: APIClient) -> str | None:
+    """Return Prime ssh_keys id for the local registered key (pod create ``sshKeyId``)."""
+    status = check_ssh_key(client)
+    if status.registered and status.matched_key_id:
+        return status.matched_key_id
+    return None
 
 
 def require_ssh_key(client: APIClient) -> None:
