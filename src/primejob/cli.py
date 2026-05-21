@@ -38,21 +38,8 @@ def _not_implemented(name: str) -> None:
     raise typer.Exit(code=1)
 
 
-@app.command()
-def login() -> None:
-    """Wrap `prime login` for first-time auth."""
-    import subprocess
-
-    bin_path = shutil.which("prime")
-    if not bin_path:
-        console.print("[red]`prime` CLI not found on PATH.[/red] Install with `uv add prime` or pipx.")
-        raise typer.Exit(code=1)
-    raise typer.Exit(code=subprocess.run([bin_path, "login"]).returncode)
-
-
-@app.command()
-def doctor() -> None:
-    """Verify auth, SDK, paramiko, prime CLI."""
+def run_doctor() -> int:
+    """Print diagnostics table; return process exit code (0 = all checks passed)."""
     table = Table(title="primejob doctor", show_header=False, box=None)
     table.add_column("check")
     table.add_column("status")
@@ -66,6 +53,7 @@ def doctor() -> None:
 
     try:
         import paramiko
+
         table.add_row("paramiko", ok, paramiko.__version__)
         paramiko_ok = True
     except Exception as e:  # noqa: BLE001
@@ -74,6 +62,7 @@ def doctor() -> None:
 
     try:
         import prime_cli
+
         table.add_row("prime_cli", ok, getattr(prime_cli, "__version__", "installed"))
     except Exception as e:  # noqa: BLE001
         table.add_row("prime_cli", bad, str(e))
@@ -82,14 +71,18 @@ def doctor() -> None:
     if prime_bin:
         table.add_row("prime CLI", ok, prime_bin)
     else:
-        table.add_row("prime CLI", "[yellow]missing[/yellow]", "not on PATH (needed for `primejob login`)")
+        table.add_row(
+            "prime CLI",
+            "[yellow]missing[/yellow]",
+            "not on PATH (needed for `primejob login`)",
+        )
 
     auth = check_auth()
     auth_detail = []
     if auth.has_env_key:
         auth_detail.append("PRIME_API_KEY env")
     if auth.has_config_file:
-        auth_detail.append(f"~/.prime/config.json")
+        auth_detail.append("~/.prime/config.json")
     detail = ", ".join(auth_detail) or "no credentials"
     if auth.client_ok:
         table.add_row("auth", ok, detail)
@@ -128,8 +121,47 @@ def doctor() -> None:
 
     console.print(table)
 
+    if auth.client_ok and not ssh_ok:
+        console.print(
+            "[dim]Tip: run `primejob login` to configure your SSH key and register it with Prime.[/dim]"
+        )
+
     if not (paramiko_ok and auth.client_ok and ssh_ok):
+        return 1
+    return 0
+
+
+@app.command()
+def login(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Non-interactive defaults."),
+    smoke_test: bool = typer.Option(
+        False,
+        "--smoke-test",
+        help="Provision a cheapest CPU pod to verify SSH after setup (small cost).",
+    ),
+) -> None:
+    """Prime API login (`prime login`) plus SSH key path + Prime ssh_keys onboarding."""
+    from primejob.onboarding import run_full_login
+
+    prime_bin = shutil.which("prime")
+    if not prime_bin:
+        console.print(
+            "[red]`prime` CLI not found on PATH.[/red] Install with `uv add prime` or pipx."
+        )
         raise typer.Exit(code=1)
+    code = run_full_login(
+        prime_bin=prime_bin,
+        console=console,
+        assume_yes=yes,
+        smoke_test=smoke_test,
+    )
+    raise typer.Exit(code=code)
+
+
+@app.command()
+def doctor() -> None:
+    """Verify auth, SDK, paramiko, prime CLI."""
+    raise typer.Exit(run_doctor())
 
 
 @gpus_app.command("list")
@@ -280,6 +312,11 @@ def run(
         "--include-data",
         help="Local path to bundle into the src tarball (repeatable; used with --data-mode local).",
     ),
+    setup_ssh: bool = typer.Option(
+        False,
+        "--setup-ssh",
+        help="Configure SSH key path and register with Prime before provisioning.",
+    ),
     plain: bool = typer.Option(False, "--plain", help="Force plain streaming output (no TUI)."),
     exit_on_finish: bool = typer.Option(False, "--exit-on-finish", help="In TUI mode, skip summary screen and exit immediately."),
 ) -> None:
@@ -304,6 +341,7 @@ def run(
         data_mode=data_mode,
         data_subdir=data_subdir,
         include_data=include_data,
+        setup_ssh=setup_ssh,
     )
 
     use_tui = sys.stdout.isatty() and not plain

@@ -11,6 +11,24 @@ uv add git+https://github.com/AleksanderObuchowski/primejob.git
 primejob doctor   # verify auth, SSH key, paramiko, SDK, prime CLI
 ```
 
+### First run
+
+1. **`primejob login`** — Runs **`prime login`** when credentials are missing, picks a working key under `~/.ssh/` (`id_ed25519`, then `id_rsa`, then `id_ecdsa`), saves `ssh_key_path` in Prime CLI config, uploads the public key to your Prime account via the API when needed, optionally promotes it to primary, then runs **`primejob doctor`**. Flags: **`--yes`** / **`-y`** for non-interactive defaults; **`--smoke-test`** provisions the cheapest CPU pod, waits for SSH, and terminates it (small cost) to validate end-to-end access.
+
+2. **`primejob doctor`** — Repeat anytime to verify auth and SSH registration.
+
+3. **`primejob run …`** — Start remote jobs (see Quickstart).
+
+Some providers expose SSH before `authorized_keys` is fully propagated. **`primejob run`** separates SSH transport retries from authentication retries (warm-up window). Tune pod SSH waits in **`pyproject.toml`**:
+
+```toml
+[tool.primejob]
+ssh_max_wait = 300      # seconds (default 300)
+ssh_retry_delay = 5     # seconds between attempts (default 5)
+```
+
+Use **`primejob run --setup-ssh`** to auto-configure your SSH key and register it with Prime before provisioning (non-interactive).
+
 When published, `uv add primejob` will work from PyPI.
 
 `PRIME_API_KEY` is read from `.env` in cwd or from `~/.prime/config.json` (after `prime login` / `primejob login`).
@@ -27,6 +45,8 @@ default_gpu  = "H200"                # short alias — resolved to H200_141GB
 default_country = "US"               # optional; biases pod placement
 default_disk_size = 50               # GB, used when creating the disk fresh
 bundle_paths = ["data/"]             # optional; used with --data-mode local
+ssh_max_wait = 300                   # optional; SSH connect budget (seconds)
+ssh_retry_delay = 5                  # optional; delay between SSH retries (seconds)
 ```
 
 ## Quickstart

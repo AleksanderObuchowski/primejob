@@ -7,6 +7,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from primejob.auth import (
+    discover_ssh_keys,
+    register_ssh_key,
     _key_registered,
     _normalize_public_key,
     check_ssh_key,
@@ -18,6 +20,12 @@ from primejob.auth import (
 def test_normalize_public_key_strips_comment() -> None:
     raw = "ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIComment me user@host"
     assert _normalize_public_key(raw).startswith("ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAI")
+
+
+def test_key_registered_by_public_key_camel_case() -> None:
+    local = "ssh-ed25519 AAAAB3NzaC1lZDI1NTE5AAAAIabc"
+    registered = [{"publicKey": f"{local} user@laptop"}]
+    assert _key_registered(local, "SHA256:unused", registered)
 
 
 def test_key_registered_by_public_key() -> None:
@@ -66,3 +74,24 @@ def test_require_ssh_key_raises_when_unregistered(
 
     with pytest.raises(RuntimeError, match="Could not read SSH key|not registered"):
         require_ssh_key(client)
+
+
+def test_discover_ssh_keys_order(tmp_path: Path) -> None:
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "id_rsa").write_text("dummy")
+    (ssh / "id_ed25519").write_text("dummy")
+    keys = discover_ssh_keys(home=tmp_path)
+    assert keys[0].name == "id_ed25519"
+    assert keys[1].name == "id_rsa"
+
+
+def test_register_ssh_key_posts_expected_payload() -> None:
+    client = MagicMock()
+    client.request.return_value = {"id": "k1"}
+    register_ssh_key(client, name="laptop", public_key_line="ssh-ed25519 AAA x")
+    client.request.assert_called_once_with(
+        "POST",
+        "/ssh_keys/",
+        json={"name": "laptop", "publicKey": "ssh-ed25519 AAA x"},
+    )

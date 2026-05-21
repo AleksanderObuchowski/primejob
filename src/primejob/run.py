@@ -32,7 +32,7 @@ from primejob.backend.pods import (
     terminate,
     wait_for_running,
 )
-from primejob.backend.ssh import SshClient, parse_ssh_endpoint
+from primejob.backend.ssh import SshClient, parse_ssh_endpoint, wait_for_ssh_connect
 from primejob.config import ProjectConfig, load_project_config
 from primejob.events import ConfirmRequest, ConsoleSink, EventSink
 from primejob.packaging import make_tarball
@@ -47,6 +47,10 @@ REMOTE_TARBALL = "/tmp/primejob/src.tar.gz"
 REMOTE_BIN = "/tmp/primejob/bin"
 REMOTE_UV = f"{REMOTE_BIN}/uv"
 REMOTE_DATASET = "/tmp/primejob/dataset"
+
+# Brief pause after API reports ACTIVE + ssh_connection — reduces immediate
+# auth_propagation churn while sshd / keys settle on some providers.
+SSH_POST_READY_SLEEP_S = 3.0
 
 DATA_MODES = frozenset({"attach", "stage", "none", "local"})
 
@@ -64,6 +68,7 @@ class RunOptions:
     data_mode: str = "attach"  # attach | stage | none | local
     data_subdir: str | None = None
     include_data: list[str] = field(default_factory=list)
+    setup_ssh: bool = False
 
 
 @dataclass
@@ -96,6 +101,17 @@ def run_training(
 
     sink.phase(Phase.PREFLIGHT)
     _validate_workspace(cwd, project)
+    if opts.setup_ssh:
+        from rich.console import Console
+
+        from primejob.onboarding import ensure_ssh_key_ready
+
+        ensure_ssh_key_ready(
+            client,
+            Console(stderr=True),
+            assume_yes=True,
+            interactive=False,
+        )
     require_ssh_key(client)
 
     gpu_type = resolve_gpu_type(opts.gpu or project.default_gpu)
@@ -294,17 +310,40 @@ def run_training(
             pod_status = wait_for_running(client, pod.id, on_progress=progress)
             fresh = get_pod(client, pod.id)
             ssh = parse_ssh_endpoint(pod_status.ssh_connection)
-            sink.status(f"SSH up at {ssh.user}@{ssh.host}:{ssh.port}")
+            sink.status(
+                f"Pod reachable ({fresh.status or '?'}); connecting SSH to "
+                f"{ssh.user}@{ssh.host}:{ssh.port}…"
+            )
+            if SSH_POST_READY_SLEEP_S > 0:
+                sink.status_note(
+                    f"  Waiting {SSH_POST_READY_SLEEP_S:.0f}s before first SSH attempt…"
+                )
+                time.sleep(SSH_POST_READY_SLEEP_S)
+
+            pod_ready_mono = time.monotonic()
+
+            def ssh_retry_detail(
+                attempt: int, total: int, delay_s: float, detail: str
+            ) -> None:
+                sink.status_note(
+                    f"  SSH [{detail}] attempt {attempt}/{total}, retry in {delay_s:.0f}s…"
+                )
+
+            auth_window = min(float(project.ssh_max_wait), 300.0)
+            connected = wait_for_ssh_connect(
+                ssh,
+                max_wait_s=float(project.ssh_max_wait),
+                retry_delay_s=float(project.ssh_retry_delay),
+                pod_ready_monotonic=pod_ready_mono,
+                auth_warmup_s=auth_window,
+                on_retry=ssh_retry_detail,
+            )
+            sink.status(f"SSH connected as {ssh.user}@{ssh.host}:{ssh.port}")
             sink.ssh_ready(ssh)
         except Exception:
             failed_phase = Phase.PROVISION
             sink.phase(Phase.PROVISION, failed=True)
             raise
-
-        def ssh_retry_note(attempt: int, total: int, delay_s: float) -> None:
-            sink.status_note(
-                f"  SSH not ready yet ({attempt}/{total}), retrying in {delay_s:.0f}s..."
-            )
 
         tarball = cwd / ".primejob" / "src.tar.gz"
 
@@ -321,7 +360,7 @@ def run_training(
         )
 
         try:
-            with SshClient(ssh, on_retry=ssh_retry_note) as sh:
+            with SshClient(ssh, prec_connected=connected) as sh:
                 sink.phase(Phase.UPLOAD)
                 if bundle_paths:
                     sink.status(

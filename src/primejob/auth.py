@@ -14,6 +14,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from prime_cli.api.client import APIClient
 
+SSH_KEY_DISCOVERY_ORDER = ("id_ed25519", "id_rsa", "id_ecdsa")
+
 
 @dataclass
 class AuthStatus:
@@ -146,15 +148,51 @@ def list_registered_ssh_keys(client: APIClient) -> list[dict]:
 
 
 def _key_registered(normalized_local: str, fingerprint: str, registered: list[dict]) -> bool:
+    return matching_ssh_key_record(registered, normalized_local, fingerprint) is not None
+
+
+def matching_ssh_key_record(
+    registered: list[dict], normalized_local: str, fingerprint: str
+) -> dict | None:
+    """Return the Prime API ssh_keys entry matching this local key, if any."""
     for item in registered:
         remote_fp = item.get("fingerprint") or item.get("sha256_fingerprint")
         if isinstance(remote_fp, str) and remote_fp.strip() == fingerprint:
-            return True
-        for field in ("public_key", "key", "ssh_public_key"):
+            return item
+        for field in ("public_key", "publicKey", "key", "ssh_public_key"):
             value = item.get(field)
             if isinstance(value, str) and _normalize_public_key(value) == normalized_local:
-                return True
-    return False
+                return item
+    return None
+
+
+def discover_ssh_keys(*, home: Path | None = None) -> list[Path]:
+    """Possible default private keys under ~/.ssh (preferred types first)."""
+    ssh_dir = (home or Path.home()) / ".ssh"
+    out: list[Path] = []
+    for name in SSH_KEY_DISCOVERY_ORDER:
+        candidate = ssh_dir / name
+        if candidate.is_file():
+            out.append(candidate)
+    return out
+
+
+def register_ssh_key(client: APIClient, *, name: str, public_key_line: str) -> dict:
+    """Upload a public key to Prime (`POST /api/v1/ssh_keys/`)."""
+    return client.request(
+        "POST",
+        "/ssh_keys/",
+        json={"name": name, "publicKey": public_key_line.strip()},
+    )
+
+
+def set_ssh_key_primary(client: APIClient, key_id: str) -> dict:
+    """Mark an SSH key as primary (`PATCH /api/v1/ssh_keys/{key_id}`)."""
+    return client.request(
+        "PATCH",
+        f"/ssh_keys/{key_id}",
+        json={"isPrimary": True},
+    )
 
 
 def check_ssh_key(client: APIClient | None = None) -> SshKeyStatus:
@@ -176,11 +214,12 @@ def check_ssh_key(client: APIClient | None = None) -> SshKeyStatus:
             key_readable=False,
             fingerprint=None,
             registered=None,
-            error=f"SSH private key not found{hint}. Run `prime config set-ssh-key-path PATH`.",
+            error=f"SSH private key not found{hint}. Run `primejob login` or `prime config set-ssh-key-path PATH`.",
         )
 
     try:
-        normalized, fingerprint = _local_public_key_text(key_path)
+        pub_text, normalized = _local_public_key_text(key_path)
+        fingerprint = _fingerprint_sha256(_load_private_key(key_path))
     except Exception as e:  # noqa: BLE001
         return SshKeyStatus(
             key_path=key_path,
@@ -200,8 +239,8 @@ def check_ssh_key(client: APIClient | None = None) -> SshKeyStatus:
             if not registered:
                 api_error = (
                     f"Public key {fingerprint} is not registered in your Prime account. "
-                    "Add it at https://app.primeintellect.ai/settings/ssh-keys "
-                    "or run `prime ssh-keys add`."
+                    "Run `primejob login` to upload it via the API, or add it in "
+                    "https://app.primeintellect.ai/settings/ssh-keys"
                 )
         except Exception as e:  # noqa: BLE001
             registered = None

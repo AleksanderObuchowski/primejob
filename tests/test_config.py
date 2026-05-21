@@ -12,6 +12,8 @@ def test_defaults_when_missing(tmp_path: Path) -> None:
     assert cfg.default_gpu == "H200"
     assert cfg.default_count == 1
     assert cfg.forward_env == []
+    assert cfg.ssh_max_wait == 300
+    assert cfg.ssh_retry_delay == 5.0
 
 
 def test_reads_tool_primejob(tmp_path: Path) -> None:
@@ -27,6 +29,8 @@ default_gpu = "H100"
 default_country = "US"
 default_count = 2
 default_disk_size = 100
+ssh_max_wait = 120
+ssh_retry_delay = 3
 """
     )
     cfg = load_project_config(tmp_path)
@@ -36,6 +40,8 @@ default_disk_size = 100
     assert cfg.default_country == "US"
     assert cfg.default_count == 2
     assert cfg.default_disk_size == 100
+    assert cfg.ssh_max_wait == 120
+    assert cfg.ssh_retry_delay == 3.0
 
 
 def test_walks_up_to_find_pyproject(tmp_path: Path) -> None:

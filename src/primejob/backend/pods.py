@@ -110,7 +110,14 @@ def wait_for_running(
                 f"Pod {pod_id} entered terminal state '{state}': "
                 f"{status.installation_failure or '(no detail)'}"
             )
-        if state in RUNNING_STATES and status.ssh_connection:
+        install_raw = getattr(status, "installation_progress", None)
+        install_ready = True
+        if install_raw is not None:
+            try:
+                install_ready = int(install_raw) >= 100
+            except (TypeError, ValueError):
+                install_ready = True
+        if state in RUNNING_STATES and status.ssh_connection and install_ready:
             return status
         if time.monotonic() - start > timeout:
             raise TimeoutError(
