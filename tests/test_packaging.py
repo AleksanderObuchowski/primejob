@@ -51,3 +51,13 @@ def test_make_tarball_roundtrip(tmp_path: Path) -> None:
     assert "data/raw/keep.txt" in names
     assert ".env" not in names
     assert "outputs/old.log" not in names
+
+
+def test_make_tarball_includes_gitignored_extra_path(tmp_path: Path) -> None:
+    root = _scaffold(tmp_path)
+    dest = tmp_path / ".primejob" / "src.tar.gz"
+    res = make_tarball(root, dest, extra_paths=[root / "data" / "raw" / "ignored.bin"])
+    with tarfile.open(dest, "r:gz") as t:
+        names = set(t.getnames())
+    assert "data/raw/ignored.bin" in names
+    assert res.file_count >= 4

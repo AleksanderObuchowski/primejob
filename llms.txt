@@ -2,19 +2,22 @@
 
 > CLI that runs a local `uv run python train.py` on a remote Prime Intellect GPU pod with reusable dataset storage. The user keeps their local UX; the training executes on rented H100/H200/A100/B200/RTX4090 hardware.
 
-primejob is a Python CLI (entry point: `primejob`, installed from `primejob` on PyPI or `git+https://github.com/AleksanderObuchowski/primejob.git`). It is configured per-project in `pyproject.toml` under `[tool.primejob]` (`dataset_disk`, `forward_env`, `default_gpu`, `default_country`, `default_disk_size`). Authentication uses `PRIME_API_KEY` from `.env` in cwd or `~/.prime/config.json` (written by `prime login` / `primejob login`).
+primejob is a Python CLI (entry point: `primejob`, installed from `git+https://github.com/AleksanderObuchowski/primejob.git`; PyPI is not published yet). It is configured per-project in `pyproject.toml` under `[tool.primejob]` (`dataset_disk`, `forward_env`, `default_gpu`, `default_country`, `default_disk_size`, `bundle_paths`, optional `ssh_max_wait`, `ssh_retry_delay`). Authentication uses `PRIME_API_KEY` from `.env` in cwd or `~/.prime/config.json` (written by `prime login`). **`primejob login`** runs `prime login` when needed, configures `ssh_key_path`, registers your public SSH key with Prime via the HTTP API when missing (optional `--yes`, `--smoke-test`), then runs **`primejob doctor`**. **`primejob login --smoke-test`** provisions a cheap CPU pod, waits until **`installation_progress` is 100%** when reported, prints live pod/install progress, applies the same short post-ready pause as **`primejob run`**, then **`wait_for_ssh_connect`** validates SSH before terminating the pod. SSH uses the private key from `~/.prime/config.json` (`ssh_key_path`, set automatically by login or via `prime config set-ssh-key-path`) or `PRIME_SSH_KEY_PATH`.
 
-When helping a user with primejob, prefer the SDK / CLI surface over guessing — Prime Intellect's public docs lag behind the actual `prime_cli.api` Python SDK. Always run `primejob doctor` first to confirm auth, paramiko, the SDK, and the `prime` CLI are wired up. GPU short aliases (`H100`, `H200`, `A100`, `B200`, `RTX4090`, `CPU`) resolve to full Prime SKUs (`H100_80GB`, `H200_141GB`, ...); `primejob gpus list` prints the full table.
+**Pod readiness:** `wait_for_running` (pods backend) requires RUNNING state, an `ssh_connection`, and **`installation_progress >= 100`** when the field exists — avoids SSH during cloud-init. **`primejob run`** then sleeps briefly (`SSH_POST_READY_SLEEP_S` in `run.py`) before counting SSH retry budgets so auth propagation time is not wasted during that pause.
+
+When helping a user with primejob, prefer the SDK / CLI surface over guessing — Prime Intellect's public docs lag behind the actual `prime_cli.api` Python SDK. Always run `primejob doctor` first to confirm auth, SSH key registration, paramiko, the SDK, and the `prime` CLI are wired up. GPU short aliases (`H100`, `H200`, `A100`, `B200`, `RTX4090`, `CPU`) resolve to full Prime SKUs (`H100_80GB`, `H200_141GB`, ...); `primejob gpus list` prints the full table.
 
 ## Core commands
 
-- `primejob doctor` — verify auth, paramiko, SDK, prime CLI
-- `primejob login` — interactive Prime API key setup
+- `primejob login` — Prime auth (`prime login` when needed), SSH key selection + `ssh_key_path`, upload key through Prime API if missing (`--yes`, `--smoke-test`), then `primejob doctor`; smoke-test waits for install completion + SSH then deletes the pod
+- `primejob doctor` — verify auth, SSH key (local + registered in Prime), paramiko, SDK, prime CLI
 - `primejob dataset push ./data` — upload dataset to the persistent disk (one-time, reused by every run)
 - `primejob dataset list` — list dataset contents on the persistent disk
-- `primejob run <script.py> --gpu H100 --yes` — pick cheapest matching offering, upload src (honors `.gitignore`), `uv sync` + `uv run python <script>`, stream output, download `outputs/`, terminate pod
+- `primejob run <script.py> --gpu H100 --yes` — pick cheapest matching offering; wait until pod reports RUNNING, SSH endpoint present, and `installation_progress` 100% when available; short pause before first SSH; then `wait_for_ssh_connect` before upload/exec; upload src (honors `.gitignore`), `uv sync` + `uv run python <script>`, stream output, download `outputs/`, terminate pod
 - `primejob run <script.py> --gpu H100 -- --epochs 10 --lr 3e-4` — everything after `--` is forwarded to the user's script
-- `primejob run <script.py> --data-mode attach|stage` — `attach` (default) mounts the disk to the training pod; `stage` copies via a helper pod so concurrent runs can share the source disk
+- `primejob run <script.py> --data-mode attach|stage|none|local` — attach (default) mounts persistent disk; stage copies via helper pod; none skips disks; local bundles `--include-data` paths into src
+- `primejob run <script.py> --setup-ssh` — auto-configure/register SSH key before provisioning (non-interactive)
 - `primejob runs list` / `primejob status <run_id>` / `primejob logs <run_id>` — inspect past runs
 - `primejob attach <run_id>` — re-open the Textual dashboard (view-only) on a running job
 - `primejob terminate <run_id>` — kill a wedged run
@@ -22,7 +25,7 @@ When helping a user with primejob, prefer the SDK / CLI surface over guessing �
 
 ## Runtime contract for user scripts
 
-- The dataset path is exposed via the `PRIMEJOB_DATASET_PATH` environment variable in both `attach` and `stage` modes — scripts should read inputs from there.
+- The dataset path is exposed via the `PRIMEJOB_DATASET_PATH` environment variable in `attach`, `stage`, and `local` modes — scripts should read inputs from there. Omitted in `none` mode.
 - Anything the script writes under `outputs/` (relative to project root on the pod) is downloaded back to `./outputs/<run_id>/` on the local machine after the run.
 - `forward_env` keys from `[tool.primejob]` are forwarded into the pod environment (typically `HF_TOKEN`, `WANDB_API_KEY`).
 - Per-run state lives in `~/.primejob/runs/<run_id>/` (`manifest.json`, `log.txt`).

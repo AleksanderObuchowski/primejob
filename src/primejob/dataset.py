@@ -24,7 +24,7 @@ from primejob.backend.pods import (
     terminate,
     wait_for_running,
 )
-from primejob.backend.ssh import SshClient, SshEndpoint
+from primejob.backend.ssh import SshClient, SshEndpoint, parse_ssh_endpoint
 from primejob.pricing import pick_cheapest
 
 
@@ -95,7 +95,7 @@ def _spawn_helper_pod(
         status = wait_for_running(client, pod.id, on_progress=on_progress)
         fresh = get_pod(client, pod.id)
         mount = mount_path_for_disk(fresh, disk_id) or HELPER_DISK_MOUNT_FALLBACK
-        ssh = SshEndpoint.parse(status.ssh_connection)
+        ssh = parse_ssh_endpoint(status.ssh_connection)
         return pod.id, ssh, mount
     except Exception:
         terminate(client, pod.id)

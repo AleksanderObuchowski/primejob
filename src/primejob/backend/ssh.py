@@ -14,9 +14,13 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Protocol
 
 import paramiko
+
+
+class SshRetryDetailCallback(Protocol):
+    def __call__(self, attempt: int, total: int, delay_s: float, detail: str) -> None: ...
 
 
 @dataclass
@@ -72,6 +76,83 @@ class SshEndpoint:
         raise ValueError(f"Unrecognized ssh_connection shape: {type(raw).__name__}")
 
 
+def parse_ssh_endpoint(raw: str | dict | object) -> SshEndpoint:
+    """Parse Prime's ssh_connection value and attach the configured private key."""
+    from primejob.auth import resolve_ssh_key_path
+
+    return SshEndpoint.parse(raw, key_path=resolve_ssh_key_path())
+
+
+def wait_for_ssh_connect(
+    endpoint: SshEndpoint,
+    *,
+    max_wait_s: float = 300.0,
+    retry_delay_s: float = 5.0,
+    connect_timeout: float = 10.0,
+    auth_warmup_s: float = 300.0,
+    pod_ready_monotonic: float | None = None,
+    on_retry: SshRetryDetailCallback | None = None,
+) -> paramiko.SSHClient:
+    """Block until SSH accepts our key or timeouts expire.
+
+    Separates \"sshd still starting\" (transport errors) from auth failures during
+    the post-boot propagation window on some providers.
+    """
+    deadline = time.monotonic() + max_wait_s
+    total_approx = max(1, int(max_wait_s / retry_delay_s))
+    pod_start = pod_ready_monotonic if pod_ready_monotonic is not None else time.monotonic()
+    attempt = 0
+    last_exc: Exception | None = None
+
+    while time.monotonic() < deadline:
+        attempt += 1
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        kwargs = dict(
+            hostname=endpoint.host,
+            port=endpoint.port,
+            username=endpoint.user,
+            timeout=connect_timeout,
+            allow_agent=True,
+            look_for_keys=True,
+        )
+        if endpoint.key_path:
+            kwargs["key_filename"] = str(endpoint.key_path)
+        detail = "transport"
+        try:
+            client.connect(**kwargs)
+            return client
+        except paramiko.AuthenticationException as e:
+            last_exc = e
+            elapsed_pod = time.monotonic() - pod_start
+            if elapsed_pod < auth_warmup_s:
+                detail = "auth_propagation"
+            else:
+                raise RuntimeError(
+                    "SSH authentication failed after waiting for key propagation. "
+                    "Run `primejob doctor` to verify your SSH key is registered in Prime."
+                ) from e
+        except (paramiko.SSHException, OSError, TimeoutError) as e:
+            last_exc = e
+            detail = "transport"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sleep_for = min(retry_delay_s, remaining)
+        if on_retry is not None:
+            on_retry(attempt, total_approx, sleep_for, detail)
+        time.sleep(sleep_for)
+
+    raise RuntimeError(
+        f"SSH connect gave up after ~{max_wait_s:.0f}s to "
+        f"{endpoint.user}@{endpoint.host}:{endpoint.port}: {last_exc}"
+    )
+
+
+class RetryCallback(Protocol):
+    def __call__(self, attempt: int, total: int, delay_s: float) -> None: ...
+
+
 @dataclass
 class ExecResult:
     exit_code: int
@@ -94,24 +175,33 @@ class SshClient:
         endpoint: SshEndpoint,
         *,
         connect_timeout: float = 10.0,
-        retries: int = 6,
+        retries: int = 24,
         retry_delay: float = 5.0,
+        on_retry: RetryCallback | None = None,
+        prec_connected: paramiko.SSHClient | None = None,
     ) -> None:
         self.endpoint = endpoint
         self.connect_timeout = connect_timeout
         self.retries = retries
         self.retry_delay = retry_delay
+        self.on_retry = on_retry
+        self._prec_connected = prec_connected
         self._client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
 
     def __enter__(self) -> "SshClient":
-        self.connect()
+        self.connect(on_retry=self.on_retry)
         return self
 
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def connect(self) -> None:
+    def connect(self, *, on_retry: RetryCallback | None = None) -> None:
+        if self._prec_connected is not None:
+            self._client = self._prec_connected
+            self._prec_connected = None
+            return
+
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         last_exc: Exception | None = None
@@ -133,6 +223,8 @@ class SshClient:
             except (paramiko.SSHException, OSError) as e:
                 last_exc = e
                 if attempt < self.retries - 1:
+                    if on_retry is not None:
+                        on_retry(attempt + 1, self.retries, self.retry_delay)
                     time.sleep(self.retry_delay)
         raise RuntimeError(
             f"SSH connect failed after {self.retries} attempts to "
