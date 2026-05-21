@@ -33,11 +33,6 @@ When helping a user with primejob, prefer the SDK / CLI surface over guessing �
 - `forward_env` keys from `[tool.primejob]` are forwarded into the pod environment (typically `HF_TOKEN`, `WANDB_API_KEY`).
 - Per-run state lives in `~/.primejob/runs/<run_id>/` (`manifest.json`, `log.txt`).
 
-## Demo / docs assets
-
-- `examples/demo_tui.py` — offline Textual TUI demo (no API/SSH/cost); `uv run python examples/demo_tui.py` or `--fast` for shorter phases
-- `docs/assets/demo.gif` — README showcase; re-record with `./scripts/record_demo_gif.sh` (tapegif + `examples/demo.tape`)
-
 ## Documentation
 
 - [README](https://github.com/Aleksanderobuchowski/primejob/blob/main/README.md) — install, configure, full workflow, dashboard keybindings, dataset modes, GPU aliases, state layout
