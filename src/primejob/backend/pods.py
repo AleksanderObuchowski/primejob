@@ -23,9 +23,10 @@ class PodSpec:
     disk_size_gb: int | None = None
     disk_ids: list[str] | None = None
     env_vars: dict[str, str] | None = None
+    ssh_key_id: str | None = None
     extra: dict | None = None
 
-    def to_create_payload(self) -> dict:
+    def to_create_payload(self, *, ssh_key_id: str | None = None) -> dict:
         """Build the POST /pods payload.
 
         Shape mirrors what the `prime` CLI sends: top-level dict with `pod`
@@ -59,6 +60,9 @@ class PodSpec:
             "customTemplateId": None,
             "envVars": [{"key": k, "value": v} for k, v in (self.env_vars or {}).items()],
         }
+        key_id = ssh_key_id if ssh_key_id is not None else self.ssh_key_id
+        if key_id:
+            inner["sshKeyId"] = key_id
 
         payload: dict = {
             "pod": inner,
@@ -73,7 +77,13 @@ class PodSpec:
 
 
 def create_pod(client: APIClient, spec: PodSpec) -> Pod:
-    payload = spec.to_create_payload()
+    """Create a pod; inject ``sshKeyId`` when the local key is registered in Prime."""
+    ssh_key_id = spec.ssh_key_id
+    if ssh_key_id is None:
+        from primejob.auth import resolve_pod_ssh_key_id
+
+        ssh_key_id = resolve_pod_ssh_key_id(client)
+    payload = spec.to_create_payload(ssh_key_id=ssh_key_id)
     return PodsClient(client).create(payload)
 
 

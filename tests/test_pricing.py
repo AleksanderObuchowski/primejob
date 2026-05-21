@@ -3,7 +3,13 @@ from __future__ import annotations
 
 import pytest
 
-from primejob.pricing import GPU_ALIASES, GpuOption, resolve_gpu_type
+from primejob.pricing import (
+    GPU_ALIASES,
+    GpuOption,
+    _provider_excluded,
+    normalize_provider_name,
+    resolve_gpu_type,
+)
 
 
 def _opt(price=1.0, gpu="H100_80GB", country="US", count=1, stock="Available", community=None):
@@ -55,3 +61,16 @@ def test_alias_table_complete() -> None:
     # the aliases we advertise to users should resolve to API-acceptable formats
     for short, full in GPU_ALIASES.items():
         assert "_" in full or full == "CPU_NODE", f"{short} → {full} looks wrong"
+
+
+def test_normalize_provider_name() -> None:
+    assert normalize_provider_name("MassedCompute") == "massedcompute"
+    assert normalize_provider_name("nebius") == "nebius"
+    assert normalize_provider_name("crusoe-cloud") == "crusoecloud"
+
+
+def test_provider_excluded_case_insensitive() -> None:
+    exclude = {normalize_provider_name("MassedCompute")}
+    assert _provider_excluded("massedcompute", exclude)
+    assert _provider_excluded("MassedCompute", exclude)
+    assert not _provider_excluded("nebius", exclude)

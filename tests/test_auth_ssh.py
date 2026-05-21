@@ -9,11 +9,14 @@ import pytest
 from primejob.auth import (
     discover_ssh_keys,
     register_ssh_key,
+    set_ssh_key_primary,
     _key_registered,
     _normalize_public_key,
     check_ssh_key,
     list_registered_ssh_keys,
+    record_is_primary,
     require_ssh_key,
+    ssh_auth_failure_hint,
 )
 
 
@@ -95,3 +98,81 @@ def test_register_ssh_key_posts_expected_payload() -> None:
         "/ssh_keys/",
         json={"name": "laptop", "publicKey": "ssh-ed25519 AAA x"},
     )
+
+
+def test_set_ssh_key_primary_patch_payload() -> None:
+    client = MagicMock()
+    client.request.return_value = {"id": "k1", "isPrimary": True}
+    set_ssh_key_primary(client, "k1")
+    client.request.assert_called_once_with(
+        "PATCH",
+        "/ssh_keys/k1",
+        json={"isPrimary": True},
+    )
+
+
+def test_record_is_primary_camel_and_snake() -> None:
+    assert record_is_primary({"isPrimary": True})
+    assert not record_is_primary({"isPrimary": False})
+    assert record_is_primary({"is_primary": True})
+    assert not record_is_primary({})
+
+
+def test_check_ssh_key_primary_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import paramiko
+
+    key_path = tmp_path / "id_rsa"
+    pkey = paramiko.RSAKey.generate(2048)
+    pkey.write_private_key_file(str(key_path))
+    pub_line = f"{pkey.get_name()} {pkey.get_base64()} test@host"
+    key_path.with_suffix(".pub").write_text(pub_line)
+
+    monkeypatch.setenv("PRIME_SSH_KEY_PATH", str(key_path))
+
+    client = MagicMock()
+    client.request.return_value = [
+        {
+            "id": "k1",
+            "fingerprint": None,
+            "publicKey": pub_line,
+            "isPrimary": True,
+        }
+    ]
+    status = check_ssh_key(client)
+    assert status.registered is True
+    assert status.is_primary is True
+    assert status.matched_key_id == "k1"
+
+
+def test_ssh_auth_failure_hint_registered_primary() -> None:
+    from primejob.auth import SshKeyStatus
+
+    st = SshKeyStatus(
+        key_path=Path("/tmp/k"),
+        key_exists=True,
+        key_readable=True,
+        fingerprint="SHA256:abc",
+        registered=True,
+        is_primary=True,
+    )
+    hint = ssh_auth_failure_hint(st, provider="massedcompute")
+    assert "massedcompute" in hint
+    assert "exclude_providers" in hint
+
+
+def test_ssh_auth_failure_hint_not_primary() -> None:
+    from primejob.auth import SshKeyStatus
+
+    st = SshKeyStatus(
+        key_path=Path("/tmp/k"),
+        key_exists=True,
+        key_readable=True,
+        fingerprint="SHA256:abc",
+        registered=True,
+        is_primary=False,
+    )
+    hint = ssh_auth_failure_hint(st)
+    assert "primary" in hint.lower()

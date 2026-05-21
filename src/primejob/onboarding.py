@@ -176,7 +176,10 @@ def run_ssh_smoke_test(client: APIClient, console: Console, *, assume_yes: bool)
     try:
         option = pick_cheapest(client, gpu_type="CPU", gpu_count=1)
         tag = uuid.uuid4().hex[:10]
-        spec = PodSpec(name=f"primejob-login-smoke-{tag}", gpu_option=option)
+        spec = PodSpec(
+            name=f"primejob-login-smoke-{tag}",
+            gpu_option=option,
+        )
         pod = create_pod(client, spec)
         pod_id = pod.id
         console.print(f"[dim]Smoke pod {pod_id} ({option.provider}) provisioning…[/dim]")

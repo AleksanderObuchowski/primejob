@@ -15,7 +15,7 @@ primejob doctor   # verify auth, SSH key, paramiko, SDK, prime CLI
 
 1. **`primejob login`** — Runs **`prime login`** when credentials are missing, picks a working key under `~/.ssh/` (`id_ed25519`, then `id_rsa`, then `id_ecdsa`), saves `ssh_key_path` in Prime CLI config, uploads the public key to your Prime account via the API when needed, optionally promotes it to primary, then runs **`primejob doctor`**. Flags: **`--yes`** / **`-y`** for non-interactive defaults; **`--smoke-test`** provisions the cheapest CPU pod, waits for SSH, and terminates it (small cost) to validate end-to-end access.
 
-2. **`primejob doctor`** — Repeat anytime to verify auth and SSH registration.
+2. **`primejob doctor`** — Repeat anytime to verify auth, SSH registration, and **primary** key status (pods receive the primary key).
 
 3. **`primejob run …`** — Start remote jobs (see Quickstart).
 
@@ -23,15 +23,35 @@ Provisioning waits until the pod is running, exposes an SSH endpoint, and (when 
 
 Right after the pod is reachable, **`primejob run`** and **`primejob login --smoke-test`** pause briefly before the first SSH attempt so `sshd` and `authorized_keys` propagation can settle.
 
-Some providers still expose SSH before keys are fully effective. **`primejob run`** then separates SSH transport retries from authentication retries (auth warm-up window inside `wait_for_ssh_connect`). Tune overall SSH budgets in **`pyproject.toml`**:
+Use **`primejob run --setup-ssh`** to auto-configure your SSH key and register it with Prime before provisioning (non-interactive).
+
+### SSH troubleshooting
+
+Prime pods receive your account's **primary** SSH public key — registration alone is not always enough. **`primejob doctor`** reports whether your local key is registered and marked primary (pod injection). **`primejob run`** (and smoke tests) send your registered key's **`sshKeyId`** in the pod create payload so Prime injects it promptly on slow providers.
+
+Some providers expose SSH while **`authorized_keys` is still empty** or never populated by Prime's backend. If you see repeated **`SSH [auth_propagation]`** retries for more than about a minute, it is usually **not** a local config issue — Prime may not have injected your registered primary key into that provider's VM.
+
+**Workarounds:**
+
+- Confirm primary status: **`primejob doctor`** or **`primejob login --yes`**
+- Exclude broken providers: **`primejob run --skip-provider massedcompute --skip-provider nebius`**
+- Persistent project config:
+
+```toml
+[tool.primejob]
+exclude_providers = ["massedcompute", "nebius", "crusoecloud"]
+```
+
+- Try a different **`--country`** to land on another provider
+- Use **`primejob run --setup-ssh`** before provisioning to register and promote your key non-interactively
+
+Tune SSH retry budgets in **`pyproject.toml`** (defaults shown):
 
 ```toml
 [tool.primejob]
 ssh_max_wait = 300      # seconds (default 300)
 ssh_retry_delay = 5     # seconds between attempts (default 5)
 ```
-
-Use **`primejob run --setup-ssh`** to auto-configure your SSH key and register it with Prime before provisioning (non-interactive).
 
 When published, `uv add primejob` will work from PyPI.
 
@@ -51,6 +71,7 @@ default_disk_size = 50               # GB, used when creating the disk fresh
 bundle_paths = ["data/"]             # optional; used with --data-mode local
 ssh_max_wait = 300                   # optional; SSH connect budget (seconds)
 ssh_retry_delay = 5                  # optional; delay between SSH retries (seconds)
+exclude_providers = ["massedcompute"]  # optional; skip providers when picking cheapest GPU
 ```
 
 ## Quickstart

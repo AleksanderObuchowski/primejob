@@ -18,6 +18,7 @@ class ProjectConfig:
     pyproject_path: Path | None = None
     ssh_max_wait: int = 300
     ssh_retry_delay: float = 5.0
+    exclude_providers: list[str] = field(default_factory=list)
 
 
 def find_pyproject(start: Path) -> Path | None:
@@ -46,4 +47,5 @@ def load_project_config(cwd: Path | None = None) -> ProjectConfig:
         pyproject_path=pyproject,
         ssh_max_wait=int(section.get("ssh_max_wait", 300)),
         ssh_retry_delay=float(section.get("ssh_retry_delay", 5.0)),
+        exclude_providers=list(section.get("exclude_providers", [])),
     )

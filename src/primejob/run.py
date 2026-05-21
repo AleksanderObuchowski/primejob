@@ -22,7 +22,11 @@ from pathlib import Path
 from dotenv import dotenv_values
 from prime_cli.api.client import APIClient
 
-from primejob.auth import require_ssh_key
+from primejob.auth import (
+    check_ssh_key,
+    require_ssh_key,
+    ssh_auth_failure_hint,
+)
 from primejob.backend.disks import disk_location, ensure_disk, find_disk, wait_for_disk_detached
 from primejob.backend.pods import (
     PodSpec,
@@ -36,7 +40,7 @@ from primejob.backend.ssh import SshClient, parse_ssh_endpoint, wait_for_ssh_con
 from primejob.config import ProjectConfig, load_project_config
 from primejob.events import ConfirmRequest, ConsoleSink, EventSink
 from primejob.packaging import make_tarball
-from primejob.pricing import pick_cheapest, resolve_gpu_type
+from primejob.pricing import pick_cheapest, resolve_gpu_type, normalize_provider_name
 from primejob.runtime import CleanupGuard, CostTracker, StatusBar
 from primejob.state import RunRecord, new_run_id
 from primejob.tui.state import FinalSummary, Phase, RunMeta
@@ -51,6 +55,8 @@ REMOTE_DATASET = "/tmp/primejob/dataset"
 # Brief pause after API reports ACTIVE + ssh_connection — reduces immediate
 # auth_propagation churn while sshd / keys settle on some providers.
 SSH_POST_READY_SLEEP_S = 3.0
+# One-time hint when auth_propagation persists — likely Prime/provider key injection.
+SSH_AUTH_PROPAGATION_HINT_AFTER_S = 60.0
 
 DATA_MODES = frozenset({"attach", "stage", "none", "local"})
 
@@ -69,6 +75,7 @@ class RunOptions:
     data_subdir: str | None = None
     include_data: list[str] = field(default_factory=list)
     setup_ssh: bool = False
+    skip_providers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -140,12 +147,18 @@ def run_training(
             country = disk_country
 
     sink.status(f"Picking cheapest {gpu_type} ×{opts.count} (country={country or 'any'})...")
+    exclude_providers = _merged_exclude_providers(project, opts.skip_providers)
+    if exclude_providers:
+        sink.status_note(
+            f"  Skipping providers: {', '.join(sorted(exclude_providers))}"
+        )
     option = pick_cheapest(
         client,
         gpu_type=gpu_type,
         gpu_count=opts.count,
         country=country,
         disks=[disk_id] if disk_id and data_mode == "attach" else None,
+        exclude_providers=exclude_providers,
     )
     rate = option.effective_price
     sink.status(
@@ -321,13 +334,29 @@ def run_training(
                 time.sleep(SSH_POST_READY_SLEEP_S)
 
             pod_ready_mono = time.monotonic()
+            ssh_status = check_ssh_key(client)
+            auth_hint = ssh_auth_failure_hint(ssh_status, provider=option.provider)
+            auth_hint_shown = False
 
             def ssh_retry_detail(
                 attempt: int, total: int, delay_s: float, detail: str
             ) -> None:
+                nonlocal auth_hint_shown
                 sink.status_note(
                     f"  SSH [{detail}] attempt {attempt}/{total}, retry in {delay_s:.0f}s…"
                 )
+                if (
+                    detail == "auth_propagation"
+                    and not auth_hint_shown
+                    and time.monotonic() - pod_ready_mono >= SSH_AUTH_PROPAGATION_HINT_AFTER_S
+                ):
+                    auth_hint_shown = True
+                    sink.status_note(
+                        "  [hint] Prime may not have injected your registered primary SSH "
+                        f"key into this provider ({option.provider or 'unknown'}). "
+                        "Try `--skip-provider`, `[tool.primejob].exclude_providers`, "
+                        "or a different `--country`."
+                    )
 
             auth_window = min(float(project.ssh_max_wait), 300.0)
             connected = wait_for_ssh_connect(
@@ -337,6 +366,7 @@ def run_training(
                 pod_ready_monotonic=pod_ready_mono,
                 auth_warmup_s=auth_window,
                 on_retry=ssh_retry_detail,
+                auth_failure_hint=auth_hint,
             )
             sink.status(f"SSH connected as {ssh.user}@{ssh.host}:{ssh.port}")
             sink.ssh_ready(ssh)
@@ -496,6 +526,20 @@ def run_training(
             pass
 
     return RunResult(record=record)
+
+
+def _merged_exclude_providers(
+    project: ProjectConfig, cli_skip: list[str]
+) -> list[str]:
+    """Merge pyproject exclude_providers with CLI --skip-provider flags."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in [*project.exclude_providers, *cli_skip]:
+        normalized = normalize_provider_name(name)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append(name.strip())
+    return out
 
 
 def _resolve_bundle_paths(

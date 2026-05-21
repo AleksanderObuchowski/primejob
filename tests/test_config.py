@@ -14,6 +14,7 @@ def test_defaults_when_missing(tmp_path: Path) -> None:
     assert cfg.forward_env == []
     assert cfg.ssh_max_wait == 300
     assert cfg.ssh_retry_delay == 5.0
+    assert cfg.exclude_providers == []
 
 
 def test_reads_tool_primejob(tmp_path: Path) -> None:
@@ -31,6 +32,7 @@ default_count = 2
 default_disk_size = 100
 ssh_max_wait = 120
 ssh_retry_delay = 3
+exclude_providers = ["massedcompute", "nebius"]
 """
     )
     cfg = load_project_config(tmp_path)
@@ -42,6 +44,7 @@ ssh_retry_delay = 3
     assert cfg.default_disk_size == 100
     assert cfg.ssh_max_wait == 120
     assert cfg.ssh_retry_delay == 3.0
+    assert cfg.exclude_providers == ["massedcompute", "nebius"]
 
 
 def test_walks_up_to_find_pyproject(tmp_path: Path) -> None:

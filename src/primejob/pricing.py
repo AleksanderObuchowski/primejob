@@ -103,6 +103,20 @@ def _from_availability(item) -> GpuOption:
     )
 
 
+def normalize_provider_name(name: str | None) -> str:
+    """Normalize provider identifiers for comparison (case-insensitive)."""
+    if not name:
+        return ""
+    return name.strip().lower().replace("-", "").replace("_", "")
+
+
+def _provider_excluded(provider: str | None, exclude: set[str]) -> bool:
+    if not exclude:
+        return False
+    normalized = normalize_provider_name(provider)
+    return normalized in exclude
+
+
 def list_gpus(
     client: APIClient,
     *,
@@ -139,7 +153,13 @@ def pick_cheapest(
     gpu_count: int = 1,
     country: str | None = None,
     disks: list[str] | None = None,
+    exclude_providers: list[str] | None = None,
 ) -> GpuOption:
+    exclude = {
+        normalize_provider_name(p)
+        for p in (exclude_providers or [])
+        if normalize_provider_name(p)
+    }
     options = list_gpus(
         client,
         country=country,
@@ -147,10 +167,16 @@ def pick_cheapest(
         gpu_count=gpu_count,
         disks=disks,
     )
-    options = [o for o in options if o.available() and o.gpu_count == gpu_count]
+    options = [
+        o
+        for o in options
+        if o.available() and o.gpu_count == gpu_count and not _provider_excluded(o.provider, exclude)
+    ]
     if not options:
+        exclude_note = f" (excluded providers: {', '.join(sorted(exclude))})" if exclude else ""
         raise RuntimeError(
-            f"No available offerings for gpu_type={gpu_type} count={gpu_count} country={country}"
+            f"No available offerings for gpu_type={gpu_type} count={gpu_count} "
+            f"country={country}{exclude_note}"
         )
     return options[0]
 
