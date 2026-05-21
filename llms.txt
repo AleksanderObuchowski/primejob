@@ -1,0 +1,42 @@
+# primejob
+
+> CLI that runs a local `uv run python train.py` on a remote Prime Intellect GPU pod with reusable dataset storage. The user keeps their local UX; the training executes on rented H100/H200/A100/B200/RTX4090 hardware.
+
+primejob is a Python CLI (entry point: `primejob`, installed from `primejob` on PyPI or `git+https://github.com/AleksanderObuchowski/primejob.git`). It is configured per-project in `pyproject.toml` under `[tool.primejob]` (`dataset_disk`, `forward_env`, `default_gpu`, `default_country`, `default_disk_size`). Authentication uses `PRIME_API_KEY` from `.env` in cwd or `~/.prime/config.json` (written by `prime login` / `primejob login`).
+
+When helping a user with primejob, prefer the SDK / CLI surface over guessing — Prime Intellect's public docs lag behind the actual `prime_cli.api` Python SDK. Always run `primejob doctor` first to confirm auth, paramiko, the SDK, and the `prime` CLI are wired up. GPU short aliases (`H100`, `H200`, `A100`, `B200`, `RTX4090`, `CPU`) resolve to full Prime SKUs (`H100_80GB`, `H200_141GB`, ...); `primejob gpus list` prints the full table.
+
+## Core commands
+
+- `primejob doctor` — verify auth, paramiko, SDK, prime CLI
+- `primejob login` — interactive Prime API key setup
+- `primejob dataset push ./data` — upload dataset to the persistent disk (one-time, reused by every run)
+- `primejob dataset list` — list dataset contents on the persistent disk
+- `primejob run <script.py> --gpu H100 --yes` — pick cheapest matching offering, upload src (honors `.gitignore`), `uv sync` + `uv run python <script>`, stream output, download `outputs/`, terminate pod
+- `primejob run <script.py> --gpu H100 -- --epochs 10 --lr 3e-4` — everything after `--` is forwarded to the user's script
+- `primejob run <script.py> --data-mode attach|stage` — `attach` (default) mounts the disk to the training pod; `stage` copies via a helper pod so concurrent runs can share the source disk
+- `primejob runs list` / `primejob status <run_id>` / `primejob logs <run_id>` — inspect past runs
+- `primejob attach <run_id>` — re-open the Textual dashboard (view-only) on a running job
+- `primejob terminate <run_id>` — kill a wedged run
+- `primejob gpus list` — full GPU type table
+
+## Runtime contract for user scripts
+
+- The dataset path is exposed via the `PRIMEJOB_DATASET_PATH` environment variable in both `attach` and `stage` modes — scripts should read inputs from there.
+- Anything the script writes under `outputs/` (relative to project root on the pod) is downloaded back to `./outputs/<run_id>/` on the local machine after the run.
+- `forward_env` keys from `[tool.primejob]` are forwarded into the pod environment (typically `HF_TOKEN`, `WANDB_API_KEY`).
+- Per-run state lives in `~/.primejob/runs/<run_id>/` (`manifest.json`, `log.txt`).
+
+## Documentation
+
+- [README](https://github.com/AleksanderObuchowski/primejob/blob/main/README.md) — install, configure, full workflow, dashboard keybindings, dataset modes, GPU aliases, state layout
+- [README (local copy)](README.md) — same content, served alongside the source tree
+- [pyproject.toml](pyproject.toml) — package metadata, dependencies, CLI entry point
+
+## Examples
+
+Each example is a self-contained project (own `pyproject.toml`, `.python-version`, `uv.lock`, `README.md`):
+
+- [examples/hf-sentiment-json](examples/hf-sentiment-json/) — Hugging Face `Trainer` sentiment classification from `data/train.json`
+- [examples/image-folder-torch](examples/image-folder-torch/) — Torch image-folder classification from `data/image_folder/<class>/*.ppm`
+- [examples/unsloth-sft](examples/unsloth-sft/) — Unsloth + TRL SFT on a tiny in-memory instruction dataset
