@@ -19,7 +19,11 @@ primejob doctor   # verify auth, SSH key, paramiko, SDK, prime CLI
 
 3. **`primejob run …`** — Start remote jobs (see Quickstart).
 
-Some providers expose SSH before `authorized_keys` is fully propagated. **`primejob run`** separates SSH transport retries from authentication retries (warm-up window). Tune pod SSH waits in **`pyproject.toml`**:
+Provisioning waits until the pod is running, exposes an SSH endpoint, and (when the API reports it) **`installation_progress` reaches 100%** — so the first connection is less likely to hit half-ready VMs.
+
+Right after the pod is reachable, **`primejob run`** and **`primejob login --smoke-test`** pause briefly before the first SSH attempt so `sshd` and `authorized_keys` propagation can settle.
+
+Some providers still expose SSH before keys are fully effective. **`primejob run`** then separates SSH transport retries from authentication retries (auth warm-up window inside `wait_for_ssh_connect`). Tune overall SSH budgets in **`pyproject.toml`**:
 
 ```toml
 [tool.primejob]
