@@ -1,5 +1,7 @@
 # primejob
 
+![primejob](docs/assets/demo.gif)
+
 CLI for running GPU training jobs on Prime Intellect. A dev who today does `uv run train.py` locally should do `primejob run train.py --gpu H100` instead — and get the same UX, but the training runs on a remote GPU pod with reusable dataset storage.
 
 ## Install

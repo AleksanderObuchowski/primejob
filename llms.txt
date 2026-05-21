@@ -35,7 +35,7 @@ When helping a user with primejob, prefer the SDK / CLI surface over guessing �
 
 ## Documentation
 
-- [README](https://github.com/AleksanderObuchowski/primejob/blob/main/README.md) — install, configure, full workflow, dashboard keybindings, dataset modes, GPU aliases, state layout
+- [README](https://github.com/Aleksanderobuchowski/primejob/blob/main/README.md) — install, configure, full workflow, dashboard keybindings, dataset modes, GPU aliases, state layout
 - [README (local copy)](README.md) — same content, served alongside the source tree
 - [pyproject.toml](pyproject.toml) — package metadata, dependencies, CLI entry point
 
