@@ -14,7 +14,7 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Protocol
 
 import paramiko
 
@@ -72,6 +72,17 @@ class SshEndpoint:
         raise ValueError(f"Unrecognized ssh_connection shape: {type(raw).__name__}")
 
 
+def parse_ssh_endpoint(raw: str | dict | object) -> SshEndpoint:
+    """Parse Prime's ssh_connection value and attach the configured private key."""
+    from primejob.auth import resolve_ssh_key_path
+
+    return SshEndpoint.parse(raw, key_path=resolve_ssh_key_path())
+
+
+class RetryCallback(Protocol):
+    def __call__(self, attempt: int, total: int, delay_s: float) -> None: ...
+
+
 @dataclass
 class ExecResult:
     exit_code: int
@@ -94,24 +105,26 @@ class SshClient:
         endpoint: SshEndpoint,
         *,
         connect_timeout: float = 10.0,
-        retries: int = 6,
+        retries: int = 24,
         retry_delay: float = 5.0,
+        on_retry: RetryCallback | None = None,
     ) -> None:
         self.endpoint = endpoint
         self.connect_timeout = connect_timeout
         self.retries = retries
         self.retry_delay = retry_delay
+        self.on_retry = on_retry
         self._client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
 
     def __enter__(self) -> "SshClient":
-        self.connect()
+        self.connect(on_retry=self.on_retry)
         return self
 
     def __exit__(self, *exc) -> None:
         self.close()
 
-    def connect(self) -> None:
+    def connect(self, *, on_retry: RetryCallback | None = None) -> None:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         last_exc: Exception | None = None
@@ -133,6 +146,8 @@ class SshClient:
             except (paramiko.SSHException, OSError) as e:
                 last_exc = e
                 if attempt < self.retries - 1:
+                    if on_retry is not None:
+                        on_retry(attempt + 1, self.retries, self.retry_delay)
                     time.sleep(self.retry_delay)
         raise RuntimeError(
             f"SSH connect failed after {self.retries} attempts to "

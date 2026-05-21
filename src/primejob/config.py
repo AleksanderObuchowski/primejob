@@ -14,6 +14,7 @@ class ProjectConfig:
     default_country: str | None = None
     default_count: int = 1
     default_disk_size: int = 50
+    bundle_paths: list[str] = field(default_factory=list)
     pyproject_path: Path | None = None
 
 
@@ -39,5 +40,6 @@ def load_project_config(cwd: Path | None = None) -> ProjectConfig:
         default_country=section.get("default_country"),
         default_count=int(section.get("default_count", 1)),
         default_disk_size=int(section.get("default_disk_size", 50)),
+        bundle_paths=list(section.get("bundle_paths", [])),
         pyproject_path=pyproject,
     )

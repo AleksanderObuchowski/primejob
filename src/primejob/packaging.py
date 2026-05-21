@@ -50,18 +50,59 @@ def _load_gitignore(root: Path) -> pathspec.PathSpec:
     return pathspec.PathSpec.from_lines("gitignore", patterns)
 
 
-def iter_project_files(root: Path) -> Iterable[Path]:
+def _iter_extra_files(root: Path, extra_paths: Iterable[Path]) -> Iterable[Path]:
+    seen: set[str] = set()
+    for raw in extra_paths:
+        path = raw if raw.is_absolute() else (root / raw)
+        path = path.resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Bundle path not found: {raw}")
+        if path.is_file():
+            rel = path.relative_to(root).as_posix()
+            if rel not in seen:
+                seen.add(rel)
+                yield path
+            continue
+        if not path.is_dir():
+            raise NotADirectoryError(path)
+        for entry in path.rglob("*"):
+            if not entry.is_file():
+                continue
+            rel = entry.relative_to(root).as_posix()
+            if rel in seen:
+                continue
+            seen.add(rel)
+            yield entry
+
+
+def iter_project_files(root: Path, *, extra_paths: Iterable[Path] | None = None) -> Iterable[Path]:
     spec = _load_gitignore(root)
+    seen: set[str] = set()
+
     for entry in root.rglob("*"):
         if not entry.is_file():
             continue
         rel = entry.relative_to(root).as_posix()
         if spec.match_file(rel):
             continue
+        seen.add(rel)
         yield entry
 
+    if extra_paths:
+        for entry in _iter_extra_files(root, extra_paths):
+            rel = entry.relative_to(root).as_posix()
+            if rel in seen:
+                continue
+            seen.add(rel)
+            yield entry
 
-def make_tarball(src_dir: Path, dest_path: Path) -> TarResult:
+
+def make_tarball(
+    src_dir: Path,
+    dest_path: Path,
+    *,
+    extra_paths: Iterable[Path] | None = None,
+) -> TarResult:
     src = src_dir.resolve()
     if not src.is_dir():
         raise NotADirectoryError(src)
@@ -70,7 +111,7 @@ def make_tarball(src_dir: Path, dest_path: Path) -> TarResult:
     count = 0
     size = 0
     with tarfile.open(dest_path, "w:gz") as tar:
-        for f in iter_project_files(src):
+        for f in iter_project_files(src, extra_paths=extra_paths):
             arcname = f.relative_to(src).as_posix()
             tar.add(f, arcname=arcname, recursive=False)
             count += 1

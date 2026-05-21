@@ -1,6 +1,8 @@
 """SshEndpoint.parse handles the shapes Prime might return."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from primejob.backend.ssh import SshEndpoint
@@ -53,3 +55,9 @@ def test_parse_none_raises() -> None:
 def test_parse_unparseable_raises() -> None:
     with pytest.raises(ValueError):
         SshEndpoint.parse("totally not an ssh thing")
+
+
+def test_parse_with_key_path() -> None:
+    key = Path("/tmp/test_key")
+    e = SshEndpoint.parse("root@1.2.3.4", key_path=key)
+    assert e.key_path == key

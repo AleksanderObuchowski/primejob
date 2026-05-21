@@ -22,6 +22,7 @@ from pathlib import Path
 from dotenv import dotenv_values
 from prime_cli.api.client import APIClient
 
+from primejob.auth import require_ssh_key
 from primejob.backend.disks import disk_location, ensure_disk, find_disk, wait_for_disk_detached
 from primejob.backend.pods import (
     PodSpec,
@@ -31,7 +32,7 @@ from primejob.backend.pods import (
     terminate,
     wait_for_running,
 )
-from primejob.backend.ssh import SshClient, SshEndpoint
+from primejob.backend.ssh import SshClient, parse_ssh_endpoint
 from primejob.config import ProjectConfig, load_project_config
 from primejob.events import ConfirmRequest, ConsoleSink, EventSink
 from primejob.packaging import make_tarball
@@ -47,6 +48,8 @@ REMOTE_BIN = "/tmp/primejob/bin"
 REMOTE_UV = f"{REMOTE_BIN}/uv"
 REMOTE_DATASET = "/tmp/primejob/dataset"
 
+DATA_MODES = frozenset({"attach", "stage", "none", "local"})
+
 
 @dataclass
 class RunOptions:
@@ -58,8 +61,9 @@ class RunOptions:
     disk: str | None = None
     yes: bool = False
     disk_size_gb: int | None = None
-    data_mode: str = "attach"  # attach | stage
+    data_mode: str = "attach"  # attach | stage | none | local
     data_subdir: str | None = None
+    include_data: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -92,13 +96,21 @@ def run_training(
 
     sink.phase(Phase.PREFLIGHT)
     _validate_workspace(cwd, project)
+    require_ssh_key(client)
 
     gpu_type = resolve_gpu_type(opts.gpu or project.default_gpu)
     country = opts.country or project.default_country
-    disk_name = opts.disk or project.dataset_disk
     data_mode = opts.data_mode.lower()
-    if data_mode not in {"attach", "stage"}:
-        raise RuntimeError("data_mode must be one of: attach, stage")
+    if data_mode not in DATA_MODES:
+        raise RuntimeError(f"data_mode must be one of: {', '.join(sorted(DATA_MODES))}")
+
+    if data_mode in {"none", "local"}:
+        disk_name = None
+    else:
+        disk_name = opts.disk or project.dataset_disk
+
+    bundle_paths = _resolve_bundle_paths(cwd, opts, project, data_mode)
+
     if data_mode == "stage" and not disk_name:
         raise RuntimeError("--data-mode stage requires --disk or [tool.primejob].dataset_disk")
     disk_id = None
@@ -281,13 +293,18 @@ def run_training(
         try:
             pod_status = wait_for_running(client, pod.id, on_progress=progress)
             fresh = get_pod(client, pod.id)
-            ssh = SshEndpoint.parse(pod_status.ssh_connection)
+            ssh = parse_ssh_endpoint(pod_status.ssh_connection)
             sink.status(f"SSH up at {ssh.user}@{ssh.host}:{ssh.port}")
             sink.ssh_ready(ssh)
         except Exception:
             failed_phase = Phase.PROVISION
             sink.phase(Phase.PROVISION, failed=True)
             raise
+
+        def ssh_retry_note(attempt: int, total: int, delay_s: float) -> None:
+            sink.status_note(
+                f"  SSH not ready yet ({attempt}/{total}), retrying in {delay_s:.0f}s..."
+            )
 
         tarball = cwd / ".primejob" / "src.tar.gz"
 
@@ -304,10 +321,15 @@ def run_training(
         )
 
         try:
-            with SshClient(ssh) as sh:
+            with SshClient(ssh, on_retry=ssh_retry_note) as sh:
                 sink.phase(Phase.UPLOAD)
-                sink.status("Packaging local src (respecting .gitignore)...")
-                tar = make_tarball(cwd, tarball)
+                if bundle_paths:
+                    sink.status(
+                        "Packaging local src (respecting .gitignore, bundling extra data paths)..."
+                    )
+                else:
+                    sink.status("Packaging local src (respecting .gitignore)...")
+                tar = make_tarball(cwd, tarball, extra_paths=bundle_paths or None)
                 sink.status(f"  → {tar.file_count} files, {tar.bytes_size/1024/1024:.1f} MB")
 
                 env = _build_remote_env(cwd, project.forward_env)
@@ -337,6 +359,10 @@ def run_training(
                         shutil.rmtree(staged_dataset_path.parent)
                     except Exception:  # noqa: BLE001
                         pass
+                elif data_mode == "local" and bundle_paths:
+                    local_dataset = _remote_dataset_path_for_bundle(cwd, bundle_paths[0])
+                    sink.status(f"Bundled dataset available at {local_dataset}")
+                    env["PRIMEJOB_DATASET_PATH"] = local_dataset
 
                 sink.phase(Phase.INSTALL)
                 sink.status("Installing uv on the pod...")
@@ -431,6 +457,40 @@ def run_training(
             pass
 
     return RunResult(record=record)
+
+
+def _resolve_bundle_paths(
+    cwd: Path,
+    opts: RunOptions,
+    project: ProjectConfig,
+    data_mode: str,
+) -> list[Path]:
+    if data_mode != "local":
+        return []
+    raw_paths = opts.include_data or project.bundle_paths
+    if not raw_paths:
+        raise RuntimeError(
+            "--data-mode local requires --include-data PATH and/or "
+            "[tool.primejob].bundle_paths in pyproject.toml"
+        )
+    resolved: list[Path] = []
+    for raw in raw_paths:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = (cwd / path).resolve()
+        else:
+            path = path.resolve()
+        if cwd.resolve() not in path.parents and path != cwd.resolve():
+            raise RuntimeError(f"Bundle path must live inside the project directory: {raw}")
+        if not path.exists():
+            raise RuntimeError(f"Bundle path not found: {raw}")
+        resolved.append(path)
+    return resolved
+
+
+def _remote_dataset_path_for_bundle(cwd: Path, bundle_path: Path) -> str:
+    rel = bundle_path.resolve().relative_to(cwd.resolve()).as_posix()
+    return f"{REMOTE_WORK}/{rel}"
 
 
 def _validate_workspace(cwd: Path, project: ProjectConfig) -> None:
