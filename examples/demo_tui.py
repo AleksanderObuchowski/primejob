@@ -8,9 +8,11 @@ can see the GPU table, stepper animation, meta-line, log scrolling, and
 keybindings. Run with:
 
     uv run python examples/demo_tui.py
+    uv run python examples/demo_tui.py --fast   # shorter phases (for README GIF)
 """
 from __future__ import annotations
 
+import argparse
 import random
 import threading
 import time
@@ -104,7 +106,9 @@ def _fake_gpu_metric(idx: int, t: float) -> GpuMetric:
 class DemoApp(PrimejobApp):
     """PrimejobApp wired up with fakes — no API client, no SSH, no costs."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, fast: bool = False) -> None:
+        if fast:
+            _apply_fast_durations()
         record = self._make_fake_record()
         # Keep attach=True so PrimejobApp.on_mount goes the attach path, which
         # we then neuter by overriding `_start_attach_mode` below. (Textual
@@ -239,5 +243,24 @@ class DemoApp(PrimejobApp):
         await super().on_unmount()
 
 
+def _apply_fast_durations() -> None:
+    """Shrink phase timers so tapegif/README captures finish in ~30s."""
+    PHASE_DURATIONS_S[Phase.PREFLIGHT] = 1.5
+    PHASE_DURATIONS_S[Phase.PROVISION] = 2.5
+    PHASE_DURATIONS_S[Phase.INSTALL] = 2.5
+    PHASE_DURATIONS_S[Phase.UPLOAD] = 2.0
+    PHASE_DURATIONS_S[Phase.RUNNING] = 14.0
+    PHASE_DURATIONS_S[Phase.WRAP] = 2.0
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="primejob TUI visual demo (no API/SSH)")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="shorter phase timers for GIF recording (docs/assets/demo.gif)",
+    )
+    args = parser.parse_args()
+    if args.fast:
+        _apply_fast_durations()
     DemoApp().run()

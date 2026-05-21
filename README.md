@@ -1,5 +1,9 @@
 # primejob
 
+![primejob TUI — provision, upload, train on remote GPUs](docs/assets/demo.gif)
+
+*Offline demo (no Prime API, SSH, or cost): `uv run python examples/demo_tui.py`. Re-record the GIF with `./scripts/record_demo_gif.sh`.*
+
 CLI for running GPU training jobs on Prime Intellect. A dev who today does `uv run train.py` locally should do `primejob run train.py --gpu H100` instead — and get the same UX, but the training runs on a remote GPU pod with reusable dataset storage.
 
 ## Install
