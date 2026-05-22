@@ -11,7 +11,7 @@ from rich.table import Table
 
 from primejob import __version__
 from primejob.auth import check_auth, check_ssh_key, get_client
-from primejob.config import load_project_config
+from primejob.config import effective_gpu_count, load_project_config
 from primejob.pricing import list_gpus, resolve_gpu_type
 
 console = Console()
@@ -305,7 +305,12 @@ def run(
     ctx: typer.Context,
     script: str = typer.Argument(..., help="Python script to run on the pod."),
     gpu: str | None = typer.Option(None, "--gpu", "-g", help="GPU type."),
-    count: int = typer.Option(1, "--count", "-n", help="GPU count."),
+    count: int | None = typer.Option(
+        None,
+        "--count",
+        "-n",
+        help="GPU count (see [tool.primejob].default_count when omitted).",
+    ),
     country: str | None = typer.Option(None, "--country", "-c", help="ISO country code."),
     disk: str | None = typer.Option(None, "--disk", "-d", help="Persistent disk to attach."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip cost confirmation."),
@@ -347,11 +352,13 @@ def run(
     """
     from primejob.run import RunAborted, RunOptions, run_training
 
+    project_cfg = load_project_config()
+
     opts = RunOptions(
         script=script,
         args=list(ctx.args),
         gpu=gpu,
-        count=count,
+        count=effective_gpu_count(count, project_cfg),
         country=country,
         disk=disk,
         yes=yes,
@@ -463,14 +470,16 @@ def logs(run_id: str) -> None:
 @app.command()
 def terminate(run_id: str) -> None:
     """Force-terminate the pod for a run."""
-    from primejob.backend.pods import terminate as kill_pod
+    from primejob.backend.pods import delete_pod
     from primejob.state import load_run
 
     record = load_run(run_id)
     if not record.pod_id:
         console.print("[yellow]No pod_id recorded for this run.[/yellow]")
         raise typer.Exit(code=1)
-    kill_pod(get_client(), record.pod_id)
+    if not delete_pod(get_client(), record.pod_id):
+        console.print("[red]Failed to terminate pod via Prime API.[/red]")
+        raise typer.Exit(code=1)
     record.status = "terminated"
     if record.ended_at is None:
         import time as _t

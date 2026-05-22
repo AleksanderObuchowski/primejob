@@ -13,8 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import paramiko
 from prime_cli.api.client import APIClient
 
+from primejob.auth import check_ssh_key, ssh_auth_failure_hint
 from primejob.backend.disks import disk_location, ensure_disk, find_disk
 from primejob.backend.pods import (
     PodSpec,
@@ -24,7 +26,14 @@ from primejob.backend.pods import (
     terminate,
     wait_for_running,
 )
-from primejob.backend.ssh import SshClient, SshEndpoint, parse_ssh_endpoint
+from primejob.backend.ssh import (
+    SSH_POST_READY_SLEEP_S,
+    SshClient,
+    SshEndpoint,
+    parse_ssh_endpoint,
+    wait_for_ssh_connect,
+)
+from primejob.config import load_project_config
 from primejob.pricing import pick_cheapest
 
 
@@ -75,6 +84,78 @@ def _auto_disk_size_gb(local_path: Path, min_gb: int = 50) -> int:
     return max(min_gb, gb_needed)
 
 
+def _wait_ssh_dataset_helper(
+    client: APIClient,
+    ssh: SshEndpoint,
+    *,
+    provider: str | None,
+) -> paramiko.SSHClient:
+    """Apply the same post-ready pause + auth warmup as ``run_training``.
+
+    Dataset helper pods reuse this path so intermittent provider key propagation
+    does not regress ``primejob dataset *`` versus ``primejob run``.
+    """
+    project = load_project_config()
+    if SSH_POST_READY_SLEEP_S > 0:
+        time.sleep(SSH_POST_READY_SLEEP_S)
+
+    pod_ready_mono = time.monotonic()
+    ssh_status = check_ssh_key(client)
+    auth_hint = ssh_auth_failure_hint(ssh_status, provider=provider)
+
+    auth_window = min(float(project.ssh_max_wait), 300.0)
+    return wait_for_ssh_connect(
+        ssh,
+        max_wait_s=float(project.ssh_max_wait),
+        retry_delay_s=float(project.ssh_retry_delay),
+        pod_ready_monotonic=pod_ready_mono,
+        auth_warmup_s=auth_window,
+        auth_failure_hint=auth_hint,
+    )
+
+
+def _remote_push_destination(
+    mount: str,
+    *,
+    local_path: Path,
+    subdir: str | None,
+) -> tuple[str | None, str]:
+    """Return ``(mkdir_p_parent_or_None, upload_destination_path)``.
+
+    Directory uploads recreate the subtree under ``mount/<name>`` where ``name`` is
+    ``subdir`` when given (relative path under ``mount``), otherwise the basename
+    of ``local_path``.
+
+    File uploads resolve to a concrete remote file path; the returned parent is
+    the directory that must exist before uploading.
+    """
+    root = mount.rstrip("/")
+
+    if local_path.is_dir():
+        if subdir is not None:
+            leaf = posixpath.normpath(subdir.replace("\\", "/")).lstrip("/")
+            if not leaf:
+                leaf = local_path.name
+        else:
+            leaf = local_path.name
+        remote_dir = posixpath.join(root, leaf)
+        return remote_dir, remote_dir
+
+    if subdir is not None:
+        rel = posixpath.normpath(subdir.replace("\\", "/")).lstrip("/")
+        remote_dest = posixpath.join(root, rel)
+    else:
+        remote_dest = posixpath.join(root, local_path.name)
+
+    parent = posixpath.dirname(remote_dest)
+    mkdir_for: str | None
+    if not parent or parent == ".":
+        mkdir_for = None
+    else:
+        mkdir_for = parent
+    return mkdir_for, remote_dest
+
+
 def _spawn_helper_pod(
     client: APIClient,
     *,
@@ -82,8 +163,12 @@ def _spawn_helper_pod(
     country: str | None,
     disk_id: str,
     on_progress: Callable | None = None,
-) -> tuple[str, SshEndpoint, str]:
-    """Create CPU_NODE pod with disk attached. Returns (pod_id, ssh, mount_path)."""
+) -> tuple[str, SshEndpoint, str, paramiko.SSHClient]:
+    """Create CPU_NODE pod with disk attached.
+
+    Returns pod_id, SSH endpoint, mount path, and a connected paramiko client
+    for passing to ``SshClient(..., prec_connected=...)``.
+    """
     opt = pick_cheapest(client, gpu_type="CPU_NODE", gpu_count=1, country=country, disks=[disk_id])
     spec = PodSpec(
         name=name,
@@ -94,9 +179,12 @@ def _spawn_helper_pod(
     try:
         status = wait_for_running(client, pod.id, on_progress=on_progress)
         fresh = get_pod(client, pod.id)
-        mount = mount_path_for_disk(fresh, disk_id) or HELPER_DISK_MOUNT_FALLBACK
+        mount_path = mount_path_for_disk(fresh, disk_id) or HELPER_DISK_MOUNT_FALLBACK
         ssh = parse_ssh_endpoint(status.ssh_connection)
-        return pod.id, ssh, mount
+        connected = _wait_ssh_dataset_helper(
+            client, ssh, provider=opt.provider,
+        )
+        return pod.id, ssh, mount_path, connected
     except Exception:
         terminate(client, pod.id)
         raise
@@ -126,23 +214,27 @@ def push(
     disk_country, _, _ = disk_location(disk)
     helper_country = disk_country or country
 
-    pod_id, ssh, mount = _spawn_helper_pod(
+    pod_id, ssh, mount, connected = _spawn_helper_pod(
         client,
         name=f"primejob-helper-{int(time.time())}",
         country=helper_country,
         disk_id=disk.id,
         on_progress=on_progress,
     )
-    target_subdir = subdir or local_path.name
-    remote_root = posixpath.join(mount, target_subdir)
+    mkdir_for, upload_dest = _remote_push_destination(
+        mount, local_path=local_path, subdir=subdir
+    )
 
     files = _local_file_count(local_path)
     bytes_total = _local_size_bytes(local_path)
     started = time.monotonic()
     try:
-        with SshClient(ssh) as sh:
-            sh.exec(f"mkdir -p {shlex.quote(remote_root)}").check()
-            sh.upload(local_path, remote_root)
+        with SshClient(ssh, prec_connected=connected) as sh:
+            if local_path.is_dir():
+                sh.exec(f"mkdir -p {shlex.quote(upload_dest)}").check()
+            elif mkdir_for:
+                sh.exec(f"mkdir -p {shlex.quote(mkdir_for)}").check()
+            sh.upload(local_path, upload_dest)
     finally:
         terminate(client, pod_id)
 
@@ -170,7 +262,7 @@ def list_files(
     disk_country, _, _ = disk_location(disk)
     helper_country = disk_country or country
 
-    pod_id, ssh, mount = _spawn_helper_pod(
+    pod_id, ssh, mount, connected = _spawn_helper_pod(
         client,
         name=f"primejob-helper-{int(time.time())}",
         country=helper_country,
@@ -178,7 +270,7 @@ def list_files(
         on_progress=on_progress,
     )
     try:
-        with SshClient(ssh) as sh:
+        with SshClient(ssh, prec_connected=connected) as sh:
             result = sh.exec(
                 f"find {shlex.quote(mount)} -type f -printf '%P\\n' 2>/dev/null"
             )
@@ -209,18 +301,22 @@ def pull(
     disk_country, _, _ = disk_location(disk)
     helper_country = disk_country or country
 
-    pod_id, ssh, mount = _spawn_helper_pod(
+    pod_id, ssh, mount, connected = _spawn_helper_pod(
         client,
         name=f"primejob-helper-{int(time.time())}",
         country=helper_country,
         disk_id=disk.id,
         on_progress=on_progress,
     )
-    remote_root = posixpath.join(mount, subdir) if subdir else mount
+    if subdir is not None:
+        rel = posixpath.normpath(subdir.replace("\\", "/")).lstrip("/")
+        remote_root = posixpath.join(mount.rstrip("/"), rel) if rel else mount
+    else:
+        remote_root = mount
 
     started = time.monotonic()
     try:
-        with SshClient(ssh) as sh:
+        with SshClient(ssh, prec_connected=connected) as sh:
             sh.download(remote_root, local_path, ignore_permission_denied=True)
     finally:
         terminate(client, pod_id)

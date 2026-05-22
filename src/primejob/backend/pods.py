@@ -139,10 +139,23 @@ def wait_for_running(
 
 def terminate(client: APIClient, pod_id: str) -> None:
     """Best-effort terminate — swallow errors (pod may already be gone)."""
+    delete_pod(client, pod_id)
+
+
+def delete_pod(client: APIClient, pod_id: str) -> bool:
+    """Request pod deletion via the API.
+
+    Returns True if the SDK delete call succeeded, False otherwise
+    (including when the pod is already gone depending on SDK behavior).
+
+    Prefer :func:`terminate` for automated cleanup paths that must not leak
+    diagnostics; use :func:`delete_pod` when the CLI needs to react to failures.
+    """
     try:
         PodsClient(client).delete(pod_id)
+        return True
     except Exception:  # noqa: BLE001
-        pass
+        return False
 
 
 def mount_path_for_disk(pod: Pod, disk_id: str) -> str | None:

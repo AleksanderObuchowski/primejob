@@ -12,6 +12,12 @@ import re
 import shlex
 import stat
 import time
+
+# Brief pause after API reports ACTIVE + ssh_connection — reduces immediate
+# auth_propagation churn while sshd / keys settle on some providers.
+SSH_POST_READY_SLEEP_S = 3.0
+# One-time hint when auth_propagation persists — likely Prime/provider key injection.
+SSH_AUTH_PROPAGATION_HINT_AFTER_S = 60.0
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
