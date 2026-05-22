@@ -18,10 +18,12 @@ class LogTailer:
         *,
         interval: float = 0.2,
         on_line: Callable[[str, str], None] | None = None,
+        initial_text_seek: int | None = None,
     ) -> None:
         self.path = path
         self.interval = interval
         self.on_line = on_line
+        self._initial_text_seek = initial_text_seek
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -38,7 +40,7 @@ class LogTailer:
             self._thread = None
 
     def _loop(self) -> None:
-        offset = 0
+        offset = 0 if self._initial_text_seek is None else self._initial_text_seek
         carry = ""
         while not self._stop.is_set():
             if self.path.exists():

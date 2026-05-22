@@ -36,7 +36,13 @@ from primejob.backend.pods import (
     terminate,
     wait_for_running,
 )
-from primejob.backend.ssh import SshClient, parse_ssh_endpoint, wait_for_ssh_connect
+from primejob.backend.ssh import (
+    SshClient,
+    SSH_AUTH_PROPAGATION_HINT_AFTER_S,
+    SSH_POST_READY_SLEEP_S,
+    parse_ssh_endpoint,
+    wait_for_ssh_connect,
+)
 from primejob.config import ProjectConfig, load_project_config
 from primejob.events import ConfirmRequest, ConsoleSink, EventSink
 from primejob.packaging import make_tarball
@@ -51,12 +57,6 @@ REMOTE_TARBALL = "/tmp/primejob/src.tar.gz"
 REMOTE_BIN = "/tmp/primejob/bin"
 REMOTE_UV = f"{REMOTE_BIN}/uv"
 REMOTE_DATASET = "/tmp/primejob/dataset"
-
-# Brief pause after API reports ACTIVE + ssh_connection — reduces immediate
-# auth_propagation churn while sshd / keys settle on some providers.
-SSH_POST_READY_SLEEP_S = 3.0
-# One-time hint when auth_propagation persists — likely Prime/provider key injection.
-SSH_AUTH_PROPAGATION_HINT_AFTER_S = 60.0
 
 DATA_MODES = frozenset({"attach", "stage", "none", "local"})
 

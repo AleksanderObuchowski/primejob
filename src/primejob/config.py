@@ -49,3 +49,8 @@ def load_project_config(cwd: Path | None = None) -> ProjectConfig:
         ssh_retry_delay=float(section.get("ssh_retry_delay", 5.0)),
         exclude_providers=list(section.get("exclude_providers", [])),
     )
+
+
+def effective_gpu_count(cli_count: int | None, cfg: ProjectConfig) -> int:
+    """CLI ``--count`` overrides ``[tool.primejob].default_count`` when omitted."""
+    return cli_count if cli_count is not None else cfg.default_count
