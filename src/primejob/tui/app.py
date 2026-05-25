@@ -351,25 +351,46 @@ class PrimejobApp(App):
     def _on_terminate_result(self, result: bool | None) -> None:
         self._terminate_pending = False
         if result is None:
-            # Force quit. Mark orphan, exit immediately.
-            self._mark_orphan_pod()
-            self.exit(130)
+            # Force quit: terminate pod and finalize manifest, then exit.
+            self._force_terminate_and_exit()
         elif result:
             # Graceful terminate: kick the pod, let run_training wind down.
             self._kick_pod_terminate()
         # else: cancelled — back to dashboard
 
-    def _mark_orphan_pod(self) -> None:
-        if not self._meta.pod_id or not self._meta.run_id:
+    def _force_terminate_and_exit(self) -> None:
+        if not self._meta.run_id:
+            self.exit(130)
+            return
+        if self._client is None:
+            self._append_log("stderr", "primejob: cannot terminate — no API client")
+            self.exit(130)
             return
         try:
-            from primejob.state import RUNS_DIR
-            (RUNS_DIR / self._meta.run_id).mkdir(parents=True, exist_ok=True)
-            (RUNS_DIR / self._meta.run_id / "orphaned.txt").write_text(
-                f"{self._meta.pod_id}\n"
+            from primejob.cleanup import force_terminate_run
+
+            force_terminate_run(
+                self._client,
+                self._meta.run_id,
+                on_status=lambda msg: self._append_log("stdout", f"primejob: {msg}"),
             )
-        except Exception:  # noqa: BLE001
-            pass
+            self._append_log(
+                "stdout",
+                f"primejob: pod terminated for run {self._meta.run_id}",
+            )
+        except Exception as e:  # noqa: BLE001
+            self._append_log("stderr", f"primejob: force terminate failed: {e}")
+            try:
+                from primejob.state import RUNS_DIR
+
+                if self._meta.pod_id:
+                    (RUNS_DIR / self._meta.run_id).mkdir(parents=True, exist_ok=True)
+                    (RUNS_DIR / self._meta.run_id / "orphaned.txt").write_text(
+                        f"{self._meta.pod_id}\n"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        self.exit(130)
 
     def _kick_pod_terminate(self) -> None:
         if not self._meta.pod_id or self._client is None:

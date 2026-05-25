@@ -16,6 +16,14 @@ FAILED_STATES = {"failed", "error", "terminated"}
 
 
 @dataclass
+class TerminateResult:
+    """Outcome of a pod terminate API call."""
+
+    success: bool
+    error: str | None = None
+
+
+@dataclass
 class PodSpec:
     name: str
     gpu_option: GpuOption
@@ -137,12 +145,18 @@ def wait_for_running(
         time.sleep(poll_interval)
 
 
-def terminate(client: APIClient, pod_id: str) -> None:
-    """Best-effort terminate — swallow errors (pod may already be gone)."""
+def terminate_pod(client: APIClient, pod_id: str) -> TerminateResult:
+    """Terminate a pod and return whether the API call succeeded."""
     try:
         PodsClient(client).delete(pod_id)
-    except Exception:  # noqa: BLE001
-        pass
+        return TerminateResult(success=True)
+    except Exception as e:  # noqa: BLE001
+        return TerminateResult(success=False, error=str(e))
+
+
+def terminate(client: APIClient, pod_id: str) -> None:
+    """Best-effort terminate — swallow errors (pod may already be gone)."""
+    terminate_pod(client, pod_id)
 
 
 def mount_path_for_disk(pod: Pod, disk_id: str) -> str | None:

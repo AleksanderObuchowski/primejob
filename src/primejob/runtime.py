@@ -1,6 +1,7 @@
 """Cost tracking, live status display, signal handling for `primejob run`."""
 from __future__ import annotations
 
+import atexit
 import signal
 import threading
 import time
@@ -93,11 +94,60 @@ class StatusBar:
                 return
 
 
+# Process-wide active cleanup for runs where signal handlers cannot register
+# (e.g. Textual worker thread). Main thread SIGINT/SIGTERM still fire this.
+_active_cleanup: Callable[[], None] | None = None
+_active_lock = threading.Lock()
+
+
+def register_active_cleanup(cleanup: Callable[[], None] | None) -> None:
+    """Register the current run's cleanup for main-thread signal delivery."""
+    global _active_cleanup
+    with _active_lock:
+        _active_cleanup = cleanup
+
+
+def _dispatch_active_cleanup() -> None:
+    with _active_lock:
+        cb = _active_cleanup
+    if cb is not None:
+        try:
+            cb()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _main_thread_signal_handler(signum, frame) -> None:
+    _dispatch_active_cleanup()
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+_main_signals_installed = False
+
+
+def _ensure_main_thread_signals() -> None:
+    global _main_signals_installed
+    if _main_signals_installed:
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _main_thread_signal_handler)
+        except ValueError:
+            pass
+    try:
+        signal.signal(signal.SIGHUP, _main_thread_signal_handler)
+    except (ValueError, AttributeError):
+        pass
+    _main_signals_installed = True
+
+
 class CleanupGuard:
     """Register a cleanup callback that runs on SIGINT/SIGTERM AND normal exit.
 
     The callback should be idempotent — we may call it multiple times.
     """
+
+    _atexit_registered = False
 
     def __init__(self, cleanup: Callable[[], None]) -> None:
         self.cleanup = cleanup
@@ -105,16 +155,26 @@ class CleanupGuard:
         self._previous: dict[int, object] = {}
 
     def __enter__(self) -> "CleanupGuard":
+        register_active_cleanup(self.cleanup)
+        _ensure_main_thread_signals()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 self._previous[sig] = signal.signal(sig, self._handler)
             except ValueError:
                 # signal can only be set from main thread — best effort.
                 pass
+        try:
+            self._previous[signal.SIGHUP] = signal.signal(signal.SIGHUP, self._handler)
+        except (ValueError, AttributeError):
+            pass
+        if not CleanupGuard._atexit_registered:
+            atexit.register(_dispatch_active_cleanup)
+            CleanupGuard._atexit_registered = True
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.fire()
+        register_active_cleanup(None)
         for sig, prev in self._previous.items():
             try:
                 signal.signal(sig, prev)  # type: ignore[arg-type]

@@ -53,3 +53,49 @@ def test_walks_up_to_find_pyproject(tmp_path: Path) -> None:
     nested.mkdir(parents=True)
     found = find_pyproject(nested)
     assert found == tmp_path / "pyproject.toml"
+
+
+def test_include_field_canonical(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "demo"
+
+[tool.primejob]
+include = ["data/pii/*.jsonl", "configs/"]
+"""
+    )
+    cfg = load_project_config(tmp_path)
+    assert cfg.include == ["data/pii/*.jsonl", "configs/"]
+    assert cfg.bundle_paths_deprecated is False
+
+
+def test_bundle_paths_alias_merges_into_include(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "demo"
+
+[tool.primejob]
+bundle_paths = ["data/pii/foo.jsonl", "data/pii/bar.jsonl"]
+"""
+    )
+    cfg = load_project_config(tmp_path)
+    assert cfg.include == ["data/pii/foo.jsonl", "data/pii/bar.jsonl"]
+    assert cfg.bundle_paths_deprecated is True
+
+
+def test_include_and_bundle_paths_merge_dedupe(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "demo"
+
+[tool.primejob]
+include = ["new/file.jsonl"]
+bundle_paths = ["legacy/file.jsonl", "new/file.jsonl"]
+"""
+    )
+    cfg = load_project_config(tmp_path)
+    assert cfg.include == ["new/file.jsonl", "legacy/file.jsonl"]
+    assert cfg.bundle_paths_deprecated is True
