@@ -11,7 +11,7 @@ from rich.table import Table
 
 from primejob import __version__
 from primejob.auth import check_auth, check_ssh_key, get_client
-from primejob.config import load_project_config
+from primejob.config import effective_gpu_count, load_project_config
 from primejob.pricing import list_gpus, resolve_gpu_type
 
 console = Console()
@@ -305,7 +305,12 @@ def run(
     ctx: typer.Context,
     script: str = typer.Argument(..., help="Python script to run on the pod."),
     gpu: str | None = typer.Option(None, "--gpu", "-g", help="GPU type."),
-    count: int = typer.Option(1, "--count", "-n", help="GPU count."),
+    count: int | None = typer.Option(
+        None,
+        "--count",
+        "-n",
+        help="GPU count (see [tool.primejob].default_count when omitted).",
+    ),
     country: str | None = typer.Option(None, "--country", "-c", help="ISO country code."),
     disk: str | None = typer.Option(None, "--disk", "-d", help="Persistent disk to attach."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip cost confirmation."),
@@ -354,11 +359,13 @@ def run(
     )
     from primejob.run import RunAborted, RunOptions, run_training
 
+    project_cfg = load_project_config()
+
     opts = RunOptions(
         script=script,
         args=list(ctx.args),
         gpu=gpu,
-        count=count,
+        count=effective_gpu_count(count, project_cfg),
         country=country,
         disk=disk,
         yes=yes,
@@ -727,6 +734,9 @@ def terminate(run_id: str) -> None:
         console.print("[yellow]No pod_id recorded for this run.[/yellow]")
         raise typer.Exit(code=1)
     record = force_terminate_run(get_client(), run_id, on_status=console.print)
+    if record.cleanup_note and record.cleanup_note.startswith("terminate failed"):
+        console.print("[red]Failed to terminate pod via Prime API.[/red]")
+        raise typer.Exit(code=1)
     console.print(f"[green]Terminated pod {record.pod_id}.[/green]")
 
 

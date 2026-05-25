@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from primejob.config import find_pyproject, load_project_config
+from primejob.config import (
+    ProjectConfig,
+    effective_gpu_count,
+    find_pyproject,
+    load_project_config,
+)
 
 
 def test_defaults_when_missing(tmp_path: Path) -> None:
@@ -45,6 +50,12 @@ exclude_providers = ["massedcompute", "nebius"]
     assert cfg.ssh_max_wait == 120
     assert cfg.ssh_retry_delay == 3.0
     assert cfg.exclude_providers == ["massedcompute", "nebius"]
+
+
+def test_effective_gpu_count_cli_overrides_config() -> None:
+    cfg = ProjectConfig(default_count=3)
+    assert effective_gpu_count(4, cfg) == 4
+    assert effective_gpu_count(None, cfg) == 3
 
 
 def test_walks_up_to_find_pyproject(tmp_path: Path) -> None:
