@@ -5,9 +5,21 @@ The big idea:
   2. confirm cost (via sink — plain prompt or TUI modal)
   3. ensure disk (if configured)
   4. create pod, wait for SSH
-  5. tarball cwd, upload, unpack on pod
+  5. analyze + tarball cwd (AST closure of entrypoint + always-include + explicit include),
+     upload, unpack on pod
   6. uv sync + uv run python <script> with env forwarded, stream output
   7. download outputs/ back, terminate pod no matter what
+
+Packaging analysis is split between this module and the CLI:
+
+- `cli.py` does the upfront `analyze_package` + interactive resolution of any
+  unresolved dynamic imports, then stashes the result on `opts.package_plan`.
+  This guarantees the resolver's `input()` call runs in plain terminal mode,
+  never inside the Textual worker thread that has been the source of TUI
+  deadlocks in past versions.
+- If `opts.package_plan` is None (library callers, tests), `run_training`
+  re-runs the analysis itself and raises if dynamic imports remain unresolved
+  and `yes=False`. The error message tells the user how to recover.
 """
 from __future__ import annotations
 
@@ -15,6 +27,7 @@ import os
 import re
 import shutil
 import shlex
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,22 +46,34 @@ from primejob.backend.pods import (
     create_pod,
     get_pod,
     mount_path_for_disk,
-    terminate,
+    terminate_pod,
     wait_for_running,
 )
+from primejob.cleanup import terminate_run_pod
 from primejob.backend.ssh import (
     SshAuthPropagationTimeout,
     SshClient,
+    SSH_AUTH_PROPAGATION_HINT_AFTER_S,
+    SSH_POST_READY_SLEEP_S,
     parse_ssh_endpoint,
     wait_for_ssh_connect,
 )
 from primejob.config import ProjectConfig, load_project_config
 from primejob.events import ConfirmRequest, ConsoleSink, EventSink
-from primejob.packaging import make_tarball
+from primejob.packaging import PackagePlan, analyze_package, make_tarball
+from primejob.packaging_ui import (
+    emit_size_warning,
+    local_dataset_remote_path,
+    make_packaging_progress,
+    make_upload_progress,
+    resolve_include_patterns,
+    warn_once,
+)
 from primejob.pricing import pick_cheapest, resolve_gpu_type, normalize_provider_name
 from primejob.runtime import CleanupGuard, CostTracker, StatusBar
 from primejob.state import RunRecord, new_run_id
 from primejob.tui.state import FinalSummary, Phase, RunMeta
+from primejob.watchdog import create_lease, heartbeat, release_lease, start_watchdog
 
 
 REMOTE_WORK = "/tmp/primejob/work"
@@ -57,12 +82,6 @@ REMOTE_BIN = "/tmp/primejob/bin"
 REMOTE_CONFIG = "/tmp/primejob/config"
 REMOTE_UV = f"{REMOTE_BIN}/uv"
 REMOTE_DATASET = "/tmp/primejob/dataset"
-
-# Brief pause after API reports ACTIVE + ssh_connection — reduces immediate
-# auth_propagation churn while sshd / keys settle on some providers.
-SSH_POST_READY_SLEEP_S = 3.0
-# One-time hint when auth_propagation persists — likely Prime/provider key injection.
-SSH_AUTH_PROPAGATION_HINT_AFTER_S = 60.0
 
 DATA_MODES = frozenset({"attach", "stage", "none", "local"})
 
@@ -90,6 +109,10 @@ class RunOptions:
     download_exclude: list[str] = field(default_factory=list)
     no_download: bool = False
     ssh_auth_timeout: float | None = None
+    # Pre-computed packaging plan. The CLI fills this in (after running the
+    # interactive resolver in plain terminal mode); library callers may leave
+    # it None and accept the non-interactive policy in run_training.
+    package_plan: PackagePlan | None = None
 
 
 @dataclass
@@ -121,7 +144,7 @@ def run_training(
         own_sink = True
 
     sink.phase(Phase.PREFLIGHT)
-    _validate_workspace(cwd, project)
+    _validate_workspace(cwd, project, opts)
     if opts.setup_ssh:
         from rich.console import Console
 
@@ -146,12 +169,50 @@ def run_training(
     else:
         disk_name = opts.disk or project.dataset_disk
 
-    if project.bundle_paths:
-        sink.status_note(
-            "  [deprecated] [tool.primejob].bundle_paths is deprecated; use "
-            "[tool.primejob].include instead."
+    include_patterns = resolve_include_patterns(
+        [*opts.include, *opts.include_data], project.include
+    )
+    if project.bundle_paths_deprecated:
+        warn_once(
+            cwd,
+            "bundle_paths_renamed",
+            "[deprecation] [tool.primejob].bundle_paths is renamed `include`. "
+            "Rename it in pyproject.toml before the next release.",
+            sink.status_note,
         )
-    bundle_paths = _resolve_bundle_paths(cwd, opts, project, data_mode)
+
+    # Use the CLI-resolved plan if one was passed; otherwise analyze here.
+    # The CLI does the upfront analysis so it can run the interactive
+    # dynamic-import resolver against a plain terminal (the resolver's
+    # input() call would deadlock against Textual). Library callers that
+    # leave this None get a non-interactive policy: unresolved + not yes
+    # is a hard error with a clear recovery message.
+    if opts.package_plan is not None:
+        package_plan = opts.package_plan
+    else:
+        script_path = (cwd / opts.script).resolve()
+        package_plan = analyze_package(
+            cwd, entrypoint=script_path, include=include_patterns
+        )
+        if package_plan.unresolved and not opts.yes:
+            lines = [
+                f"  {u.file.name}:{u.lineno}  {u.description}"
+                for u in package_plan.unresolved
+            ]
+            raise RuntimeError(
+                f"Static analysis could not resolve "
+                f"{len(package_plan.unresolved)} dynamic import(s):\n"
+                + "\n".join(lines)
+                + "\nRe-run with --yes to ship the static closure (logged as warning), "
+                "or add the resolved paths to [tool.primejob].include."
+            )
+        if package_plan.unresolved and opts.yes:
+            sink.status_note(
+                "[warn] Shipping with unresolved dynamic imports — "
+                f"{len(package_plan.unresolved)} site(s). "
+                "Static closure only; add to [tool.primejob].include if the "
+                "script needs more files at runtime."
+            )
     uv_args = _build_uv_args(project, opts)
     download_outputs = project.download_outputs and not opts.no_download
     download_include = _dedupe([*project.download_include, *opts.download_include])
@@ -282,32 +343,62 @@ def run_training(
     tracker = CostTracker(rate_per_hr=rate)
     error_lines: list[str] = []
     failed_phase: Phase | None = None
+    heartbeat_stop = threading.Event()
+
+    def _heartbeat_loop() -> None:
+        while not heartbeat_stop.wait(15.0):
+            try:
+                heartbeat(run_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop, daemon=True, name="primejob-heartbeat"
+    )
+    heartbeat_thread.start()
+
+    _cleanup_done = False
 
     def cleanup() -> None:
-        if record.pod_id:
-            sink.status(f"Terminating pod {record.pod_id}...")
-            try:
-                terminate(client, record.pod_id)
-            except Exception as e:  # noqa: BLE001
-                sink.status(f"  (terminate failed: {e})")
+        nonlocal _cleanup_done
+        if _cleanup_done:
+            return
+        _cleanup_done = True
+        heartbeat_stop.set()
+        terminate_run_pod(
+            client,
+            record,
+            on_status=sink.status,
+            total_cost=tracker.spent() if record.ended_at is None else record.total_cost,
+            cleanup_note=record.cleanup_note,
+        )
         if disk_id and data_mode == "attach":
             try:
                 sink.status(f"Waiting for disk '{disk_name}' to detach...")
                 wait_for_disk_detached(client, disk_id, timeout=180)
             except Exception as e:  # noqa: BLE001
                 sink.status(f"  (disk detach wait failed: {e})")
-        if record.ended_at is None:
-            record.ended_at = time.time()
-            record.total_cost = tracker.spent()
-            if record.status == "running":
-                record.status = "terminated"
-            record.save()
 
     with CleanupGuard(cleanup):
         failed_providers: list[str] = []
         fresh = None
         ssh = None
         connected = None
+
+        def progress(status):
+            heartbeat(run_id)
+            state = (status.status or "?").lower()
+            sink.status_note(
+                f"  pod={state} install={status.installation_progress or 0}% "
+                f"rate=${status.cost_per_hr or 0:.4f}/h"
+            )
+            if status.cost_per_hr:
+                tracker.update_rate(status.cost_per_hr)
+            sink.cost(
+                started_at=tracker.started_at,
+                rate_per_hr=tracker.rate_per_hr,
+                spent=tracker.spent(),
+            )
 
         while True:
             sink.phase(Phase.PROVISION)
@@ -326,6 +417,9 @@ def run_training(
             record.rate_per_hr = option.effective_price
             record.save()
 
+            create_lease(run_id, pod.id)
+            start_watchdog(run_id, pod.id)
+
             sink.meta(RunMeta(
                 run_id=run_id,
                 script=opts.script,
@@ -342,20 +436,6 @@ def run_training(
             )
             tracker.update_rate(option.effective_price)
             sink.status("Waiting for pod to become running...")
-
-            def progress(status):
-                state = (status.status or "?").lower()
-                sink.status_note(
-                    f"  pod={state} install={status.installation_progress or 0}% "
-                    f"rate=${status.cost_per_hr or 0:.4f}/h"
-                )
-                if status.cost_per_hr:
-                    tracker.update_rate(status.cost_per_hr)
-                sink.cost(
-                    started_at=tracker.started_at,
-                    rate_per_hr=tracker.rate_per_hr,
-                    spent=tracker.spent(),
-                )
 
             try:
                 pod_status = wait_for_running(client, pod.id, on_progress=progress)
@@ -421,11 +501,12 @@ def run_training(
                     f"  SSH auth propagation stalled on provider {provider}: {e}"
                 )
                 sink.status(f"Terminating pod {pod.id} before provider fallback...")
-                try:
-                    terminate(client, pod.id)
-                finally:
-                    record.pod_id = None
-                    record.save()
+                result = terminate_pod(client, pod.id)
+                if not result.success:
+                    sink.status(f"  → terminate failed: {result.error}")
+                release_lease(run_id)
+                record.pod_id = None
+                record.save()
                 failed_providers.append(provider)
                 next_exclude = [*exclude_providers, *failed_providers]
                 sink.status_note(
@@ -467,35 +548,49 @@ def run_training(
 
         tarball = cwd / ".primejob" / "src.tar.gz"
 
+        def _on_status_tick() -> None:
+            heartbeat(run_id)
+            sink.cost(
+                started_at=tracker.started_at,
+                rate_per_hr=tracker.rate_per_hr,
+                spent=tracker.spent(),
+            )
+
         bar = StatusBar(
             run_id,
             tracker,
             lambda msg: sink.status_note(msg),
             interval=30.0,
-            on_tick=lambda: sink.cost(
-                started_at=tracker.started_at,
-                rate_per_hr=tracker.rate_per_hr,
-                spent=tracker.spent(),
-            ),
+            on_tick=_on_status_tick,
         )
 
         try:
             with SshClient(ssh, prec_connected=connected) as sh:
                 sink.phase(Phase.UPLOAD)
-                if bundle_paths:
-                    sink.status(
-                        "Packaging local src (respecting .gitignore, bundling extra data paths)..."
-                    )
-                else:
-                    sink.status("Packaging local src (respecting .gitignore)...")
-                tar = make_tarball(cwd, tarball, extra_paths=bundle_paths or None)
-                sink.status(f"  → {tar.file_count} files, {tar.bytes_size/1024/1024:.1f} MB")
+                sink.status(
+                    f"Packaging via import analysis of {opts.script} "
+                    f"({package_plan.summary()})..."
+                )
+                tar = make_tarball(
+                    cwd,
+                    tarball,
+                    package_plan,
+                    on_tick=make_packaging_progress(sink),
+                )
+                sink.status(
+                    f"  → {tar.file_count} files, {tar.bytes_size/1024/1024:.1f} MB"
+                )
+                emit_size_warning(sink, tar)
 
                 env = _build_remote_env(cwd, project.forward_env)
 
                 sink.status("Uploading src tarball...")
                 try:
-                    sh.upload(tarball, REMOTE_TARBALL)
+                    sh.upload(
+                        tarball,
+                        REMOTE_TARBALL,
+                        progress=make_upload_progress(sink, tar.bytes_size),
+                    )
                     sh.exec(
                         f"mkdir -p {REMOTE_WORK} && tar -xzf {REMOTE_TARBALL} -C {REMOTE_WORK} && rm -f {REMOTE_TARBALL}"
                     ).check()
@@ -518,10 +613,11 @@ def run_training(
                         shutil.rmtree(staged_dataset_path.parent)
                     except Exception:  # noqa: BLE001
                         pass
-                elif data_mode == "local" and bundle_paths:
-                    local_dataset = _remote_dataset_path_for_bundle(cwd, bundle_paths[0])
-                    sink.status(f"Bundled dataset available at {local_dataset}")
-                    env["PRIMEJOB_DATASET_PATH"] = local_dataset
+                elif data_mode == "local":
+                    local_dataset = local_dataset_remote_path(package_plan, REMOTE_WORK)
+                    if local_dataset is not None:
+                        sink.status(f"Bundled dataset available at {local_dataset}")
+                        env["PRIMEJOB_DATASET_PATH"] = local_dataset
 
                 sink.phase(Phase.INSTALL)
                 sink.status("Installing uv on the pod...")
@@ -618,7 +714,12 @@ def run_training(
 def _merged_exclude_providers(
     project: ProjectConfig, cli_skip: list[str]
 ) -> list[str]:
-    """Merge pyproject exclude_providers with CLI --skip-provider flags."""
+    """Merge pyproject exclude_providers with CLI --skip-provider flags.
+
+    Provider normalization (case + whitespace) means we can't reuse the
+    string-equality `dedupe_preserve_order` helper directly without losing
+    the user's preferred display capitalization.
+    """
     seen: set[str] = set()
     out: list[str] = []
     for name in [*project.exclude_providers, *cli_skip]:
@@ -627,40 +728,6 @@ def _merged_exclude_providers(
             seen.add(normalized)
             out.append(name.strip())
     return out
-
-
-def _resolve_bundle_paths(
-    cwd: Path,
-    opts: RunOptions,
-    project: ProjectConfig,
-    data_mode: str,
-) -> list[Path]:
-    if data_mode != "local":
-        return []
-    raw_paths = _dedupe([
-        *project.include,
-        *project.bundle_paths,
-        *opts.include,
-        *opts.include_data,
-    ])
-    if not raw_paths:
-        raise RuntimeError(
-            "--data-mode local requires --include PATH and/or "
-            "[tool.primejob].include in pyproject.toml"
-        )
-    resolved: list[Path] = []
-    for raw in raw_paths:
-        path = Path(raw).expanduser()
-        if not path.is_absolute():
-            path = (cwd / path).resolve()
-        else:
-            path = path.resolve()
-        if cwd.resolve() not in path.parents and path != cwd.resolve():
-            raise RuntimeError(f"Bundle path must live inside the project directory: {raw}")
-        if not path.exists():
-            raise RuntimeError(f"Bundle path not found: {raw}")
-        resolved.append(path)
-    return resolved
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -723,12 +790,7 @@ def _build_uv_run_cmd(opts: RunOptions, uv_args: list[str]) -> str:
     return " ".join(pieces)
 
 
-def _remote_dataset_path_for_bundle(cwd: Path, bundle_path: Path) -> str:
-    rel = bundle_path.resolve().relative_to(cwd.resolve()).as_posix()
-    return f"{REMOTE_WORK}/{rel}"
-
-
-def _validate_workspace(cwd: Path, project: ProjectConfig) -> None:
+def _validate_workspace(cwd: Path, project: ProjectConfig, opts: "RunOptions") -> None:
     if not (cwd / "pyproject.toml").exists():
         raise RuntimeError(
             f"No pyproject.toml in {cwd}. primejob expects a uv-managed project."
@@ -736,6 +798,21 @@ def _validate_workspace(cwd: Path, project: ProjectConfig) -> None:
     if not (cwd / "uv.lock").exists():
         raise RuntimeError(
             f"No uv.lock in {cwd}. Run `uv lock` (or `uv sync`) before `primejob run`."
+        )
+    script_path = (cwd / opts.script).resolve()
+    if not script_path.is_file():
+        raise RuntimeError(f"Entrypoint script not found: {opts.script}")
+    if script_path.suffix != ".py":
+        raise RuntimeError(
+            f"primejob only supports .py entrypoints (got {opts.script}). "
+            "Wrap your shell or other entrypoint in a small train.py file that "
+            "subprocess.run()s it."
+        )
+    try:
+        script_path.relative_to(cwd.resolve())
+    except ValueError:
+        raise RuntimeError(
+            f"Entrypoint must live inside the project directory: {opts.script}"
         )
     missing = []
     env_path = cwd / ".env"

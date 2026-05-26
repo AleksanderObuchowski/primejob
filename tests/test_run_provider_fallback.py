@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from primejob.backend.ssh import ExecResult, SshAuthPropagationTimeout, SshEndpoint
+from primejob.backend.pods import TerminateResult
 from primejob.config import ProjectConfig
 from primejob.pricing import GpuOption
 from primejob.run import RunOptions, run_training
@@ -50,7 +51,7 @@ class FakeSshClient:
     def __exit__(self, *exc) -> None:
         pass
 
-    def upload(self, local_path, remote_path) -> None:
+    def upload(self, local_path, remote_path, **kwargs) -> None:
         pass
 
     def exec(self, cmd: str) -> ExecResult:
@@ -93,6 +94,7 @@ def test_run_training_falls_back_on_auth_propagation_timeout(
 ) -> None:
     (tmp_path / "pyproject.toml").write_text("[project]\nname='demo'\n")
     (tmp_path / "uv.lock").write_text("")
+    (tmp_path / "train.py").write_text("print('ok')\n")
     monkeypatch.setattr("primejob.state.RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr("primejob.run.require_ssh_key", lambda client: None)
     monkeypatch.setattr("primejob.run.check_ssh_key", lambda client: SimpleNamespace())
@@ -100,6 +102,10 @@ def test_run_training_falls_back_on_auth_propagation_timeout(
     monkeypatch.setattr("primejob.run.SSH_POST_READY_SLEEP_S", 0.0)
     monkeypatch.setattr("primejob.run.SshClient", FakeSshClient)
     monkeypatch.setattr("primejob.run.new_run_id", lambda: "run1")
+    monkeypatch.setattr("primejob.run.create_lease", lambda run_id, pod_id: None)
+    monkeypatch.setattr("primejob.run.start_watchdog", lambda run_id, pod_id: None)
+    monkeypatch.setattr("primejob.run.release_lease", lambda run_id: None)
+    monkeypatch.setattr("primejob.run.heartbeat", lambda run_id: None)
 
     options = [_gpu("massedcompute", 1.0), _gpu("nebius", 1.2)]
     pick_excludes: list[list[str]] = []
@@ -137,7 +143,17 @@ def test_run_training_falls_back_on_auth_propagation_timeout(
         return SimpleNamespace(id=pod_id)
 
     monkeypatch.setattr("primejob.run.create_pod", fake_create)
-    monkeypatch.setattr("primejob.run.terminate", lambda client, pod_id: terminated.append(pod_id))
+    def fake_terminate_pod(client, pod_id):
+        terminated.append(pod_id)
+        return TerminateResult(success=True)
+
+    monkeypatch.setattr("primejob.run.terminate_pod", fake_terminate_pod)
+
+    def fake_terminate_run_pod(client, record, **kwargs):
+        if record.pod_id:
+            terminated.append(record.pod_id)
+
+    monkeypatch.setattr("primejob.run.terminate_run_pod", fake_terminate_run_pod)
     connect_calls = 0
 
     def fake_wait_for_ssh_connect(*args, **kwargs):

@@ -166,11 +166,15 @@ class PrimejobApp(App):
 
         # Replay the existing log file.
         log_widget = self.query_one(LogView)
+        tail_cookie = None
         if rec.log_path.exists():
-            for line in rec.log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                stream = "stderr" if line.startswith("[stderr] ") else "stdout"
-                payload = line[len("[stderr] "):] if stream == "stderr" else line
-                log_widget.append(stream, payload)
+            with rec.log_path.open(encoding="utf-8", errors="replace") as f:
+                for raw_line in f:
+                    line = raw_line.rstrip("\r\n")
+                    stream = "stderr" if line.startswith("[stderr] ") else "stdout"
+                    payload = line[len("[stderr] ") :] if stream == "stderr" else line
+                    log_widget.append(stream, payload)
+                tail_cookie = f.tell()
 
         # Mark phase from the record.
         stepper = self.query_one(Stepper)
@@ -209,12 +213,8 @@ class PrimejobApp(App):
             self._tailer = LogTailer(
                 rec.log_path,
                 on_line=lambda s, l: self.call_from_thread(self._append_log, s, l),
+                initial_text_seek=tail_cookie,
             )
-            # Seek to end of file we already replayed — set offset via stop+start trick:
-            # Easier: just point tailer at the file; replay above already showed history,
-            # but tailer will start from offset 0. We'll re-read what we already showed.
-            # For MVP we accept duplicates from tail starting at 0 — refine later by
-            # peeking at file size and seeking past it.
             self._tailer.start()
 
         # Note: nvidia poller requires a live SSH endpoint. We don't store it in
@@ -351,33 +351,58 @@ class PrimejobApp(App):
     def _on_terminate_result(self, result: bool | None) -> None:
         self._terminate_pending = False
         if result is None:
-            # Force quit. Mark orphan, exit immediately.
-            self._mark_orphan_pod()
-            self.exit(130)
+            # Force quit: terminate pod and finalize manifest, then exit.
+            self._force_terminate_and_exit()
         elif result:
             # Graceful terminate: kick the pod, let run_training wind down.
             self._kick_pod_terminate()
         # else: cancelled — back to dashboard
 
-    def _mark_orphan_pod(self) -> None:
-        if not self._meta.pod_id or not self._meta.run_id:
+    def _force_terminate_and_exit(self) -> None:
+        if not self._meta.run_id:
+            self.exit(130)
+            return
+        if self._client is None:
+            self._append_log("stderr", "primejob: cannot terminate — no API client")
+            self.exit(130)
             return
         try:
-            from primejob.state import RUNS_DIR
-            (RUNS_DIR / self._meta.run_id).mkdir(parents=True, exist_ok=True)
-            (RUNS_DIR / self._meta.run_id / "orphaned.txt").write_text(
-                f"{self._meta.pod_id}\n"
+            from primejob.cleanup import force_terminate_run
+
+            force_terminate_run(
+                self._client,
+                self._meta.run_id,
+                on_status=lambda msg: self._append_log("stdout", f"primejob: {msg}"),
             )
-        except Exception:  # noqa: BLE001
-            pass
+            self._append_log(
+                "stdout",
+                f"primejob: pod terminated for run {self._meta.run_id}",
+            )
+        except Exception as e:  # noqa: BLE001
+            self._append_log("stderr", f"primejob: force terminate failed: {e}")
+            try:
+                from primejob.state import RUNS_DIR
+
+                if self._meta.pod_id:
+                    (RUNS_DIR / self._meta.run_id).mkdir(parents=True, exist_ok=True)
+                    (RUNS_DIR / self._meta.run_id / "orphaned.txt").write_text(
+                        f"{self._meta.pod_id}\n"
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        self.exit(130)
 
     def _kick_pod_terminate(self) -> None:
         if not self._meta.pod_id or self._client is None:
             return
         try:
-            from primejob.backend.pods import terminate as kill_pod
-            kill_pod(self._client, self._meta.pod_id)
-            self._append_log("stdout", f"primejob: terminate requested for pod {self._meta.pod_id}")
+            from primejob.backend.pods import delete_pod
+
+            deleted = delete_pod(self._client, self._meta.pod_id)
+            if deleted:
+                self._append_log("stdout", f"primejob: terminate requested for pod {self._meta.pod_id}")
+            else:
+                self._append_log("stderr", "primejob: terminate failed (Prime API)")
         except Exception as e:  # noqa: BLE001
             self._append_log("stderr", f"primejob: terminate failed: {e}")
 

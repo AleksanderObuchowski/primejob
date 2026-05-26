@@ -32,7 +32,7 @@ def test_run_include_data_emits_deprecation_warning(monkeypatch) -> None:
 
     result = runner.invoke(
         app,
-        ["run", "--plain", "--include-data", "data", "train.py"],
+        ["run", "--plain", "--include-data", "data", "examples/hello_train.py"],
     )
 
     assert result.exit_code == 0
@@ -62,7 +62,7 @@ def test_run_include_does_not_emit_deprecation_warning(monkeypatch) -> None:
 
     result = runner.invoke(
         app,
-        ["run", "--plain", "--include", "data", "train.py"],
+        ["run", "--plain", "--include", "data", "examples/hello_train.py"],
     )
 
     assert result.exit_code == 0

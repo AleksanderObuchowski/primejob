@@ -11,7 +11,7 @@ from rich.table import Table
 
 from primejob import __version__
 from primejob.auth import check_auth, check_ssh_key, get_client
-from primejob.config import load_project_config
+from primejob.config import effective_gpu_count, load_project_config
 from primejob.pricing import list_gpus, resolve_gpu_type
 
 console = Console()
@@ -305,7 +305,12 @@ def run(
     ctx: typer.Context,
     script: str = typer.Argument(..., help="Python script to run on the pod."),
     gpu: str | None = typer.Option(None, "--gpu", "-g", help="GPU type."),
-    count: int = typer.Option(1, "--count", "-n", help="GPU count."),
+    count: int | None = typer.Option(
+        None,
+        "--count",
+        "-n",
+        help="GPU count (see [tool.primejob].default_count when omitted).",
+    ),
     country: str | None = typer.Option(None, "--country", "-c", help="ISO country code."),
     disk: str | None = typer.Option(None, "--disk", "-d", help="Persistent disk to attach."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip cost confirmation."),
@@ -324,7 +329,7 @@ def run(
         [],
         "--include",
         "-i",
-        help="Local path to bundle into the src tarball (repeatable; used with --data-mode local).",
+        help="Local path or glob to include in the uploaded package (repeatable).",
     ),
     include_data: list[str] = typer.Option(
         [],
@@ -386,8 +391,16 @@ def run(
     By default opens a Textual dashboard when stdout is a TTY. Pass --plain to
     force the old line-by-line streaming output (useful for CI / nohup / pipes).
     """
+    from primejob.packaging import analyze_package
+    from primejob.packaging_ui import (
+        UnresolvedImportsAborted,
+        handle_unresolved_imports,
+        resolve_include_patterns,
+        warn_once,
+    )
     from primejob.run import RunAborted, RunOptions, run_training
 
+    project_cfg = load_project_config()
     if include_data:
         console.print("[yellow]Warning:[/yellow] --include-data is deprecated; use --include.")
 
@@ -395,7 +408,7 @@ def run(
         script=script,
         args=list(ctx.args),
         gpu=gpu,
-        count=count,
+        count=effective_gpu_count(count, project_cfg),
         country=country,
         disk=disk,
         yes=yes,
@@ -414,6 +427,49 @@ def run(
         no_download=no_download,
         ssh_auth_timeout=ssh_auth_timeout,
     )
+
+    # Upfront packaging analysis: lets the interactive resolver run in plain
+    # terminal mode (Textual would deadlock if input() ran from its worker).
+    # The deprecation warning and the dynamic-import resolver both fire here,
+    # before TUI takes over. If analysis fails (bad script path, etc.), we
+    # surface the error in plain mode rather than the TUI's error screen.
+    cwd = Path.cwd()
+    try:
+        project = load_project_config(cwd)
+        if project.bundle_paths_deprecated:
+            warn_once(
+                cwd,
+                "bundle_paths_renamed",
+                "[yellow]deprecation:[/yellow] "
+                r"\[tool.primejob].bundle_paths is renamed `include`. "
+                "Rename it in pyproject.toml before the next release.",
+                console.print,
+            )
+
+        include_patterns = resolve_include_patterns(
+            [*opts.include, *opts.include_data], project.include
+        )
+        script_path = (cwd / opts.script).resolve()
+        if not script_path.is_file():
+            console.print(f"[red]Entrypoint script not found:[/red] {opts.script}")
+            raise typer.Exit(code=1)
+        if script_path.suffix != ".py":
+            console.print(
+                f"[red]primejob only supports .py entrypoints (got {opts.script}).[/red]"
+            )
+            raise typer.Exit(code=1)
+        plan = analyze_package(cwd, entrypoint=script_path, include=include_patterns)
+        try:
+            handle_unresolved_imports(plan, console=console, yes=opts.yes)
+        except UnresolvedImportsAborted as e:
+            console.print(f"[yellow]Aborted:[/yellow] {e}")
+            raise typer.Exit(code=130)
+        opts.package_plan = plan
+    except typer.Exit:
+        raise
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=1)
 
     use_tui = sys.stdout.isatty() and not plain
     if use_tui:
@@ -435,6 +491,141 @@ def run(
 
 
 @app.command()
+def package(
+    script: str = typer.Argument(..., help="Entrypoint .py file (same as `primejob run`)."),
+    include: list[str] = typer.Option(
+        [],
+        "--include",
+        "-i",
+        help="Extra include pattern (repeatable). Merged with [tool.primejob].include.",
+    ),
+    output: str | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write tarball to this path (default: ./primejob-package.tar.gz).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print analysis only — do not build the tarball.",
+    ),
+) -> None:
+    """Inspect what would ship to the pod for a given entrypoint.
+
+    Walks `script`'s import graph, applies the always-include manifest
+    (pyproject.toml, uv.lock, README*, ...), and adds any explicit `include`
+    patterns. Prints files by provenance and flags unresolved dynamic imports.
+    """
+    from primejob.config import find_pyproject
+    from primejob.packaging import analyze_package, make_tarball
+    from primejob.packaging_ui import (
+        SIZE_WARN_THRESHOLD_BYTES,
+        resolve_include_patterns,
+        warn_once,
+    )
+
+    script_input = Path(script).expanduser()
+    script_path = (script_input if script_input.is_absolute() else Path.cwd() / script_input).resolve()
+    if not script_path.is_file():
+        console.print(f"[red]Script not found:[/red] {script}")
+        raise typer.Exit(code=1)
+    if script_path.suffix != ".py":
+        console.print(
+            f"[red]primejob only supports .py entrypoints (got {script}).[/red]"
+        )
+        raise typer.Exit(code=1)
+    # Find the project root by walking up from the script. Lets the command
+    # work from anywhere (e.g. `primejob package /tmp/proj/train.py`).
+    pyproject = find_pyproject(script_path.parent)
+    if pyproject is None:
+        console.print(
+            f"[red]No pyproject.toml found at or above {script_path.parent}.[/red] "
+            "primejob expects a uv-managed project."
+        )
+        raise typer.Exit(code=1)
+    cwd = pyproject.parent
+    cfg = load_project_config(cwd)
+    if cfg.bundle_paths_deprecated:
+        warn_once(
+            cwd,
+            "bundle_paths_renamed",
+            "[yellow]deprecation:[/yellow] "
+            r"\[tool.primejob].bundle_paths is renamed `include`. "
+            "Rename it in pyproject.toml before the next release.",
+            console.print,
+        )
+
+    merged_include = resolve_include_patterns(include, cfg.include)
+    plan = analyze_package(cwd, entrypoint=script_path, include=merged_include)
+
+    console.print(f"[bold]Packaging plan for[/bold] [cyan]{script}[/cyan]")
+    console.print(f"[dim]Root: {cwd}[/dim]")
+    console.print()
+
+    def _list(title: str, paths: list[Path]) -> None:
+        if not paths:
+            return
+        console.print(f"[bold]{title}[/bold] ({len(paths)})")
+        for p in sorted(paths):
+            try:
+                rel = p.resolve().relative_to(cwd).as_posix()
+            except ValueError:
+                rel = str(p)
+            console.print(f"  {rel}")
+        console.print()
+
+    _list("Python imports (AST closure)", plan.python_imports)
+    _list("Always included", plan.always_included)
+    _list("Explicit include", plan.explicit_includes)
+    if plan.pathspec_walk:
+        _list("Pathspec walk (fallback)", plan.pathspec_walk)
+
+    if plan.unresolved:
+        console.print(
+            f"[yellow]Unresolved dynamic imports[/yellow] ({len(plan.unresolved)})"
+        )
+        for u in plan.unresolved:
+            try:
+                rel = u.file.resolve().relative_to(cwd).as_posix()
+            except ValueError:
+                rel = str(u.file)
+            console.print(f"  {rel}:{u.lineno}  {u.description}")
+        console.print(
+            "[dim]If these load local files at runtime, add the paths to "
+            r"\[tool.primejob].include in pyproject.toml.[/dim]"
+        )
+        console.print()
+
+    all_files = plan.all_files()
+    total = 0
+    for f in all_files:
+        try:
+            total += f.stat().st_size
+        except OSError:
+            continue
+    console.print(
+        f"[bold]Total:[/bold] {len(all_files)} files, "
+        f"{total / (1024 ** 2):.1f} MB (uncompressed)"
+    )
+
+    if dry_run:
+        return
+
+    dest = Path(output).expanduser().resolve() if output else (cwd / "primejob-package.tar.gz")
+    console.print(f"[bold]Writing[/bold] {dest}...")
+    tar = make_tarball(cwd, dest, plan)
+    console.print(
+        f"[green]Done.[/green] {tar.file_count} files, "
+        f"{tar.bytes_size / (1024 ** 2):.1f} MB at {dest}"
+    )
+    if tar.bytes_size >= SIZE_WARN_THRESHOLD_BYTES:
+        console.print("[yellow]Largest files:[/yellow]")
+        for rel, sz in tar.largest:
+            console.print(f"  {sz / (1024 ** 2):6.1f} MB  {rel}")
+
+
+@app.command()
 def attach(run_id: str) -> None:
     """Re-open the dashboard for an existing run (view-only)."""
     from primejob.tui import attach_dashboard
@@ -446,14 +637,21 @@ def attach(run_id: str) -> None:
 @runs_app.command("list")
 def runs_list(
     limit: int = typer.Option(20, "--limit", "-n"),
+    check_remote: bool = typer.Option(
+        False,
+        "--check-remote",
+        help="Poll Prime for pods that may still be billing while local status is running.",
+    ),
 ) -> None:
     """List recent local runs."""
+    from primejob.reconcile import assess_run, format_status_label
     from primejob.state import list_runs
 
     records = list_runs(limit=limit)
     if not records:
         console.print("[dim]No runs yet.[/dim]")
         return
+    client = get_client() if check_remote else None
     table = Table(title="Recent runs")
     table.add_column("run_id", style="cyan")
     table.add_column("script")
@@ -461,43 +659,109 @@ def runs_list(
     table.add_column("status")
     table.add_column("cost", justify="right")
     table.add_column("exit", justify="right")
+    stale_count = 0
     for r in records:
+        health = assess_run(r, client, check_remote=check_remote)
+        if health.stale:
+            stale_count += 1
         cost = f"${r.total_cost:.4f}" if r.total_cost else "-"
         exit_code = str(r.exit_code) if r.exit_code is not None else "-"
         table.add_row(
             r.run_id,
             f"{r.script} {' '.join(r.args)}".strip()[:40],
             f"{r.gpu_type}×{r.gpu_count}",
-            r.status,
+            format_status_label(health),
             cost,
             exit_code,
         )
     console.print(table)
+    if stale_count:
+        console.print(
+            f"[yellow]{stale_count} run(s) look stale.[/yellow] "
+            "Use [cyan]primejob runs reconcile[/cyan] or [cyan]primejob terminate <run_id>[/cyan]."
+        )
+
+
+@runs_app.command("reconcile")
+def runs_reconcile(
+    terminate_stale: bool = typer.Option(
+        False,
+        "--terminate-stale",
+        help="Terminate remote pods for stale local runs that still show running.",
+    ),
+    limit: int = typer.Option(50, "--limit", "-n"),
+) -> None:
+    """Detect stale local runs and optionally terminate orphaned pods."""
+    from primejob.cleanup import terminate_run_pod
+    from primejob.reconcile import assess_run
+    from primejob.state import list_runs
+
+    client = get_client()
+    records = list_runs(limit=limit)
+    stale = [r for r in records if assess_run(r, client, check_remote=True).stale]
+    if not stale:
+        console.print("[green]No stale runs detected.[/green]")
+        return
+
+    for record in stale:
+        health = assess_run(record, client, check_remote=True)
+        console.print(
+            f"[yellow]stale[/yellow] {record.run_id} pod={record.pod_id} "
+            f"— {health.reason}"
+        )
+        if terminate_stale and record.pod_id:
+            terminate_run_pod(
+                client,
+                record,
+                cleanup_note="reconcile --terminate-stale",
+            )
+            console.print(f"  [green]terminated pod {record.pod_id}[/green]")
+
+    if not terminate_stale:
+        console.print(
+            "[dim]Re-run with --terminate-stale to stop billing on these pods.[/dim]"
+        )
 
 
 @app.command()
 def status(run_id: str) -> None:
     """Show status of a run (local + remote)."""
-    from primejob.backend.pods import get_status as remote_status
+    from primejob.reconcile import assess_run
     from primejob.state import load_run
 
     record = load_run(run_id)
+    client = get_client()
+    health = assess_run(record, client, check_remote=True)
+
     console.print(f"[bold]run_id:[/bold] {record.run_id}")
     console.print(f"  pod_id: {record.pod_id}")
     console.print(f"  gpu:    {record.gpu_type} ×{record.gpu_count} @ {record.provider} ({record.country})")
     console.print(f"  script: {record.script} {' '.join(record.args)}")
     console.print(f"  status: {record.status}  exit={record.exit_code}  cost=${record.total_cost or 0:.4f}")
+    if record.cleanup_note:
+        console.print(f"  cleanup: {record.cleanup_note}")
     console.print(f"  logs:   {record.log_path}")
 
-    if record.pod_id and record.status == "running":
-        try:
-            live = remote_status(get_client(), record.pod_id)
+    if health.stale:
+        console.print(f"  [bold red]stale:[/bold red] {health.reason}")
+        if health.remote_active:
             console.print(
-                f"  [dim]live: status={live.status} install={live.installation_progress}% "
-                f"rate=${live.cost_per_hr or 0:.4f}/h[/dim]"
+                f"  [red]Remote pod may still be billing ({health.remote_status}).[/red] "
+                f"Run [cyan]primejob terminate {run_id}[/cyan]"
             )
-        except Exception as e:  # noqa: BLE001
-            console.print(f"  [yellow]live status unavailable: {e}[/yellow]")
+        else:
+            console.print(
+                f"  [yellow]Recover with[/yellow] [cyan]primejob terminate {run_id}[/cyan] "
+                "or [cyan]primejob runs reconcile --terminate-stale[/cyan]"
+            )
+    elif record.pod_id and record.status == "running":
+        if health.remote_status:
+            console.print(
+                f"  [dim]live: status={health.remote_status} "
+                f"(active={health.remote_active})[/dim]"
+            )
+        else:
+            console.print("  [yellow]live status unavailable[/yellow]")
 
 
 @app.command()
@@ -515,19 +779,17 @@ def logs(run_id: str) -> None:
 @app.command()
 def terminate(run_id: str) -> None:
     """Force-terminate the pod for a run."""
-    from primejob.backend.pods import terminate as kill_pod
+    from primejob.cleanup import force_terminate_run
     from primejob.state import load_run
 
     record = load_run(run_id)
     if not record.pod_id:
         console.print("[yellow]No pod_id recorded for this run.[/yellow]")
         raise typer.Exit(code=1)
-    kill_pod(get_client(), record.pod_id)
-    record.status = "terminated"
-    if record.ended_at is None:
-        import time as _t
-        record.ended_at = _t.time()
-    record.save()
+    record = force_terminate_run(get_client(), run_id, on_status=console.print)
+    if record.cleanup_note and record.cleanup_note.startswith("terminate failed"):
+        console.print("[red]Failed to terminate pod via Prime API.[/red]")
+        raise typer.Exit(code=1)
     console.print(f"[green]Terminated pod {record.pod_id}.[/green]")
 
 

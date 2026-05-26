@@ -29,6 +29,7 @@ class RunRecord:
     total_cost: float | None = None
     disk_name: str | None = None
     status: str = "running"  # running | finished | failed | terminated
+    cleanup_note: str | None = None
 
     @property
     def dir(self) -> Path:
