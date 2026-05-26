@@ -36,7 +36,12 @@ from primejob.backend.pods import (
     terminate,
     wait_for_running,
 )
-from primejob.backend.ssh import SshClient, parse_ssh_endpoint, wait_for_ssh_connect
+from primejob.backend.ssh import (
+    SshAuthPropagationTimeout,
+    SshClient,
+    parse_ssh_endpoint,
+    wait_for_ssh_connect,
+)
 from primejob.config import ProjectConfig, load_project_config
 from primejob.events import ConfirmRequest, ConsoleSink, EventSink
 from primejob.packaging import make_tarball
@@ -49,6 +54,7 @@ from primejob.tui.state import FinalSummary, Phase, RunMeta
 REMOTE_WORK = "/tmp/primejob/work"
 REMOTE_TARBALL = "/tmp/primejob/src.tar.gz"
 REMOTE_BIN = "/tmp/primejob/bin"
+REMOTE_CONFIG = "/tmp/primejob/config"
 REMOTE_UV = f"{REMOTE_BIN}/uv"
 REMOTE_DATASET = "/tmp/primejob/dataset"
 
@@ -73,9 +79,17 @@ class RunOptions:
     disk_size_gb: int | None = None
     data_mode: str = "attach"  # attach | stage | none | local
     data_subdir: str | None = None
+    include: list[str] = field(default_factory=list)
     include_data: list[str] = field(default_factory=list)
     setup_ssh: bool = False
     skip_providers: list[str] = field(default_factory=list)
+    uv_extras: list[str] = field(default_factory=list)
+    uv_groups: list[str] = field(default_factory=list)
+    uv_all_extras: bool = False
+    download_include: list[str] = field(default_factory=list)
+    download_exclude: list[str] = field(default_factory=list)
+    no_download: bool = False
+    ssh_auth_timeout: float | None = None
 
 
 @dataclass
@@ -132,7 +146,16 @@ def run_training(
     else:
         disk_name = opts.disk or project.dataset_disk
 
+    if project.bundle_paths:
+        sink.status_note(
+            "  [deprecated] [tool.primejob].bundle_paths is deprecated; use "
+            "[tool.primejob].include instead."
+        )
     bundle_paths = _resolve_bundle_paths(cwd, opts, project, data_mode)
+    uv_args = _build_uv_args(project, opts)
+    download_outputs = project.download_outputs and not opts.no_download
+    download_include = _dedupe([*project.download_include, *opts.download_include])
+    download_exclude = _dedupe([*project.download_exclude, *opts.download_exclude])
 
     if data_mode == "stage" and not disk_name:
         raise RuntimeError("--data-mode stage requires --disk or [tool.primejob].dataset_disk")
@@ -256,28 +279,6 @@ def run_training(
             f"in {pulled.elapsed_s:.1f}s"
         )
 
-    sink.phase(Phase.PROVISION)
-    sink.status(f"Creating pod (run_id={run_id})...")
-    spec = PodSpec(
-        name=f"primejob-{run_id}",
-        gpu_option=option,
-        disk_ids=[disk_id] if disk_id and data_mode == "attach" else None,
-    )
-    pod = create_pod(client, spec)
-    record.pod_id = pod.id
-    record.save()
-
-    sink.meta(RunMeta(
-        run_id=run_id,
-        script=opts.script,
-        args=list(opts.args),
-        gpu_type=option.gpu_type,
-        gpu_count=option.gpu_count,
-        country=option.country,
-        provider=option.provider,
-        pod_id=pod.id,
-    ))
-
     tracker = CostTracker(rate_per_hr=rate)
     error_lines: list[str] = []
     failed_phase: Phase | None = None
@@ -303,77 +304,166 @@ def run_training(
             record.save()
 
     with CleanupGuard(cleanup):
-        sink.status("Waiting for pod to become running...")
+        failed_providers: list[str] = []
+        fresh = None
+        ssh = None
+        connected = None
 
-        def progress(status):
-            state = (status.status or "?").lower()
-            sink.status_note(
-                f"  pod={state} install={status.installation_progress or 0}% "
-                f"rate=${status.cost_per_hr or 0:.4f}/h"
+        while True:
+            sink.phase(Phase.PROVISION)
+            sink.status(f"Creating pod (run_id={run_id})...")
+            spec = PodSpec(
+                name=f"primejob-{run_id}",
+                gpu_option=option,
+                disk_ids=[disk_id] if disk_id and data_mode == "attach" else None,
             )
-            if status.cost_per_hr:
-                tracker.update_rate(status.cost_per_hr)
-            sink.cost(
-                started_at=tracker.started_at,
-                rate_per_hr=tracker.rate_per_hr,
-                spent=tracker.spent(),
-            )
+            pod = create_pod(client, spec)
+            record.pod_id = pod.id
+            record.gpu_type = option.gpu_type
+            record.gpu_count = option.gpu_count
+            record.country = option.country
+            record.provider = option.provider
+            record.rate_per_hr = option.effective_price
+            record.save()
 
-        try:
-            pod_status = wait_for_running(client, pod.id, on_progress=progress)
-            fresh = get_pod(client, pod.id)
-            ssh = parse_ssh_endpoint(pod_status.ssh_connection)
+            sink.meta(RunMeta(
+                run_id=run_id,
+                script=opts.script,
+                args=list(opts.args),
+                gpu_type=option.gpu_type,
+                gpu_count=option.gpu_count,
+                country=option.country,
+                provider=option.provider,
+                pod_id=pod.id,
+            ))
             sink.status(
-                f"Pod reachable ({fresh.status or '?'}); connecting SSH to "
-                f"{ssh.user}@{ssh.host}:{ssh.port}…"
+                f"  → {option.gpu_type} ×{option.gpu_count} @ {option.provider} "
+                f"({option.country}, {option.data_center}) ${option.effective_price:.4f}/h"
             )
-            if SSH_POST_READY_SLEEP_S > 0:
-                sink.status_note(
-                    f"  Waiting {SSH_POST_READY_SLEEP_S:.0f}s before first SSH attempt…"
-                )
-                time.sleep(SSH_POST_READY_SLEEP_S)
+            tracker.update_rate(option.effective_price)
+            sink.status("Waiting for pod to become running...")
 
-            pod_ready_mono = time.monotonic()
-            ssh_status = check_ssh_key(client)
-            auth_hint = ssh_auth_failure_hint(ssh_status, provider=option.provider)
-            auth_hint_shown = False
-
-            def ssh_retry_detail(
-                attempt: int, total: int, delay_s: float, detail: str
-            ) -> None:
-                nonlocal auth_hint_shown
+            def progress(status):
+                state = (status.status or "?").lower()
                 sink.status_note(
-                    f"  SSH [{detail}] attempt {attempt}/{total}, retry in {delay_s:.0f}s…"
+                    f"  pod={state} install={status.installation_progress or 0}% "
+                    f"rate=${status.cost_per_hr or 0:.4f}/h"
                 )
-                if (
-                    detail == "auth_propagation"
-                    and not auth_hint_shown
-                    and time.monotonic() - pod_ready_mono >= SSH_AUTH_PROPAGATION_HINT_AFTER_S
-                ):
-                    auth_hint_shown = True
+                if status.cost_per_hr:
+                    tracker.update_rate(status.cost_per_hr)
+                sink.cost(
+                    started_at=tracker.started_at,
+                    rate_per_hr=tracker.rate_per_hr,
+                    spent=tracker.spent(),
+                )
+
+            try:
+                pod_status = wait_for_running(client, pod.id, on_progress=progress)
+                fresh = get_pod(client, pod.id)
+                ssh = parse_ssh_endpoint(pod_status.ssh_connection)
+                sink.status(
+                    f"Pod reachable ({fresh.status or '?'}); connecting SSH to "
+                    f"{ssh.user}@{ssh.host}:{ssh.port}…"
+                )
+                if SSH_POST_READY_SLEEP_S > 0:
                     sink.status_note(
-                        "  [hint] Prime may not have injected your registered primary SSH "
-                        f"key into this provider ({option.provider or 'unknown'}). "
-                        "Try `--skip-provider`, `[tool.primejob].exclude_providers`, "
-                        "or a different `--country`."
+                        f"  Waiting {SSH_POST_READY_SLEEP_S:.0f}s before first SSH attempt…"
                     )
+                    time.sleep(SSH_POST_READY_SLEEP_S)
 
-            auth_window = min(float(project.ssh_max_wait), 300.0)
-            connected = wait_for_ssh_connect(
-                ssh,
-                max_wait_s=float(project.ssh_max_wait),
-                retry_delay_s=float(project.ssh_retry_delay),
-                pod_ready_monotonic=pod_ready_mono,
-                auth_warmup_s=auth_window,
-                on_retry=ssh_retry_detail,
-                auth_failure_hint=auth_hint,
-            )
-            sink.status(f"SSH connected as {ssh.user}@{ssh.host}:{ssh.port}")
-            sink.ssh_ready(ssh)
-        except Exception:
-            failed_phase = Phase.PROVISION
-            sink.phase(Phase.PROVISION, failed=True)
-            raise
+                pod_ready_mono = time.monotonic()
+                ssh_status = check_ssh_key(client)
+                auth_hint = ssh_auth_failure_hint(ssh_status, provider=option.provider)
+                auth_hint_shown = False
+
+                def ssh_retry_detail(
+                    attempt: int, total: int, delay_s: float, detail: str
+                ) -> None:
+                    nonlocal auth_hint_shown
+                    sink.status_note(
+                        f"  SSH [{detail}] attempt {attempt}/{total}, retry in {delay_s:.0f}s…"
+                    )
+                    if (
+                        detail == "auth_propagation"
+                        and not auth_hint_shown
+                        and time.monotonic() - pod_ready_mono >= SSH_AUTH_PROPAGATION_HINT_AFTER_S
+                    ):
+                        auth_hint_shown = True
+                        sink.status_note(
+                            "  [hint] Prime may not have injected your registered primary SSH "
+                            f"key into this provider ({option.provider or 'unknown'}). "
+                            "Try `--skip-provider`, `[tool.primejob].exclude_providers`, "
+                            "or a different `--country`."
+                        )
+
+                auth_window = min(float(project.ssh_max_wait), 300.0)
+                auth_timeout = (
+                    float(opts.ssh_auth_timeout)
+                    if opts.ssh_auth_timeout is not None
+                    else float(project.ssh_auth_timeout)
+                )
+                connected = wait_for_ssh_connect(
+                    ssh,
+                    max_wait_s=float(project.ssh_max_wait),
+                    retry_delay_s=float(project.ssh_retry_delay),
+                    pod_ready_monotonic=pod_ready_mono,
+                    auth_warmup_s=auth_window,
+                    auth_timeout_s=auth_timeout,
+                    on_retry=ssh_retry_detail,
+                    auth_failure_hint=auth_hint,
+                )
+                sink.status(f"SSH connected as {ssh.user}@{ssh.host}:{ssh.port}")
+                sink.ssh_ready(ssh)
+                break
+            except SshAuthPropagationTimeout as e:
+                provider = option.provider or "unknown"
+                sink.status_note(
+                    f"  SSH auth propagation stalled on provider {provider}: {e}"
+                )
+                sink.status(f"Terminating pod {pod.id} before provider fallback...")
+                try:
+                    terminate(client, pod.id)
+                finally:
+                    record.pod_id = None
+                    record.save()
+                failed_providers.append(provider)
+                next_exclude = [*exclude_providers, *failed_providers]
+                sink.status_note(
+                    f"  Provider fallback: previous={provider}, reason=ssh_auth_timeout, "
+                    "selecting next provider..."
+                )
+                option = pick_cheapest(
+                    client,
+                    gpu_type=gpu_type,
+                    gpu_count=opts.count,
+                    country=country,
+                    disks=[disk_id] if disk_id and data_mode == "attach" else None,
+                    exclude_providers=next_exclude,
+                )
+                rate = option.effective_price
+                if not opts.yes:
+                    prompt = f"Spawn fallback pod at ${rate:.4f}/h? [y/N]: "
+                    ok = sink.confirm(ConfirmRequest(
+                        prompt=prompt,
+                        gpu_type=option.gpu_type,
+                        gpu_count=option.gpu_count,
+                        rate_per_hr=rate,
+                        provider=option.provider,
+                        country=option.country,
+                    ))
+                    if not ok:
+                        raise RunAborted("User declined fallback.")
+                sink.status_note(
+                    f"  Provider fallback: next={option.provider or 'unknown'} "
+                    f"({option.country}, {option.data_center})"
+                )
+            except Exception:
+                failed_phase = Phase.PROVISION
+                sink.phase(Phase.PROVISION, failed=True)
+                raise
+
+        if fresh is None or ssh is None or connected is None:
+            raise RuntimeError("Pod provisioning finished without an SSH connection.")
 
         tarball = cwd / ".primejob" / "src.tar.gz"
 
@@ -435,12 +525,7 @@ def run_training(
 
                 sink.phase(Phase.INSTALL)
                 sink.status("Installing uv on the pod...")
-                install = sh.exec(
-                    f"mkdir -p {shlex.quote(REMOTE_BIN)} && "
-                    f"test -x {shlex.quote(REMOTE_UV)} || "
-                    f"curl -LsSf https://astral.sh/uv/install.sh | "
-                    f"env UV_INSTALL_DIR={shlex.quote(REMOTE_BIN)} sh"
-                )
+                install = sh.exec(_build_uv_install_cmd())
                 if install.exit_code != 0:
                     for line in install.stdout.splitlines():
                         sink.log_line("stderr", line)
@@ -452,10 +537,7 @@ def run_training(
                     raise RuntimeError(f"uv install failed (exit={install.exit_code})")
 
                 sink.status("Running `uv sync`...")
-                sync = sh.exec(
-                    f"cd {shlex.quote(REMOTE_WORK)} && "
-                    f"PATH={shlex.quote(REMOTE_BIN)}:$PATH {shlex.quote(REMOTE_UV)} sync"
-                )
+                sync = sh.exec(_build_uv_sync_cmd(uv_args))
                 if sync.exit_code != 0:
                     for line in sync.stdout.splitlines():
                         sink.log_line("stderr", line)
@@ -469,11 +551,7 @@ def run_training(
                 sink.phase(Phase.RUNNING)
                 bar.start()
                 cmd_args = " ".join(shlex.quote(a) for a in opts.args)
-                remote_cmd = (
-                    f"cd {shlex.quote(REMOTE_WORK)} && "
-                    f"PATH={shlex.quote(REMOTE_BIN)}:$PATH "
-                    f"{shlex.quote(REMOTE_UV)} run python {shlex.quote(opts.script)} {cmd_args}"
-                )
+                remote_cmd = _build_uv_run_cmd(opts, uv_args)
                 sink.status(f"Running: {opts.script} {cmd_args}".rstrip())
 
                 def on_line(stream: str, line: str) -> None:
@@ -486,12 +564,21 @@ def run_training(
 
                 sink.phase(Phase.WRAP)
                 sink.status(f"Remote process exited with code {exit_code}")
-                sink.status("Downloading outputs/...")
                 local_outputs = cwd / "outputs" / run_id
-                try:
-                    sh.download(f"{REMOTE_WORK}/outputs", local_outputs)
-                except FileNotFoundError:
-                    sink.status("  (no outputs/ produced)")
+                if download_outputs:
+                    sink.status("Downloading outputs/...")
+                    try:
+                        sh.download(
+                            f"{REMOTE_WORK}/outputs",
+                            local_outputs,
+                            include_patterns=download_include,
+                            exclude_patterns=download_exclude,
+                            match_root_name="outputs",
+                        )
+                    except FileNotFoundError:
+                        sink.status("  (no outputs/ produced)")
+                else:
+                    sink.status("Skipping outputs/ download (--no-download or download_outputs=false).")
         finally:
             bar.stop()
 
@@ -550,11 +637,16 @@ def _resolve_bundle_paths(
 ) -> list[Path]:
     if data_mode != "local":
         return []
-    raw_paths = opts.include_data or project.bundle_paths
+    raw_paths = _dedupe([
+        *project.include,
+        *project.bundle_paths,
+        *opts.include,
+        *opts.include_data,
+    ])
     if not raw_paths:
         raise RuntimeError(
-            "--data-mode local requires --include-data PATH and/or "
-            "[tool.primejob].bundle_paths in pyproject.toml"
+            "--data-mode local requires --include PATH and/or "
+            "[tool.primejob].include in pyproject.toml"
         )
     resolved: list[Path] = []
     for raw in raw_paths:
@@ -569,6 +661,66 @@ def _resolve_bundle_paths(
             raise RuntimeError(f"Bundle path not found: {raw}")
         resolved.append(path)
     return resolved
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def _build_uv_args(project: ProjectConfig, opts: RunOptions) -> list[str]:
+    extras = _dedupe([*project.uv_extras, *opts.uv_extras])
+    groups = _dedupe([*project.uv_groups, *opts.uv_groups])
+    args: list[str] = []
+    if project.uv_all_extras or opts.uv_all_extras:
+        args.append("--all-extras")
+    for extra in extras:
+        args.extend(["--extra", extra])
+    for group in groups:
+        args.extend(["--group", group])
+    return args
+
+
+def _build_uv_install_cmd() -> str:
+    return (
+        f"mkdir -p {shlex.quote(REMOTE_BIN)} {shlex.quote(REMOTE_CONFIG)} && "
+        f"test -x {shlex.quote(REMOTE_UV)} || "
+        "curl -LsSf https://astral.sh/uv/install.sh | "
+        f"env UV_INSTALL_DIR={shlex.quote(REMOTE_BIN)} "
+        f"XDG_CONFIG_HOME={shlex.quote(REMOTE_CONFIG)} "
+        "INSTALLER_NO_MODIFY_PATH=1 sh"
+    )
+
+
+def _build_uv_sync_cmd(uv_args: list[str]) -> str:
+    args = " ".join(shlex.quote(a) for a in uv_args)
+    suffix = f" {args}" if args else ""
+    return (
+        f"cd {shlex.quote(REMOTE_WORK)} && "
+        f"PATH={shlex.quote(REMOTE_BIN)}:$PATH {shlex.quote(REMOTE_UV)} sync{suffix}"
+    )
+
+
+def _build_uv_run_cmd(opts: RunOptions, uv_args: list[str]) -> str:
+    uv_flags = " ".join(shlex.quote(a) for a in uv_args)
+    script_args = " ".join(shlex.quote(a) for a in opts.args)
+    pieces = [
+        f"cd {shlex.quote(REMOTE_WORK)} &&",
+        f"PATH={shlex.quote(REMOTE_BIN)}:$PATH",
+        shlex.quote(REMOTE_UV),
+        "run",
+    ]
+    if uv_flags:
+        pieces.append(uv_flags)
+    pieces.extend(["python", "-u", shlex.quote(opts.script)])
+    if script_args:
+        pieces.append(script_args)
+    return " ".join(pieces)
 
 
 def _remote_dataset_path_for_bundle(cwd: Path, bundle_path: Path) -> str:

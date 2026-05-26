@@ -68,9 +68,16 @@ forward_env  = ["HF_TOKEN", "WANDB_API_KEY"]
 default_gpu  = "H200"                # short alias — resolved to H200_141GB
 default_country = "US"               # optional; biases pod placement
 default_disk_size = 50               # GB, used when creating the disk fresh
-bundle_paths = ["data/"]             # optional; used with --data-mode local
+include = ["data/"]                  # optional; used with --data-mode local
+uv_extras = ["training"]             # optional; passed to uv sync/run as --extra
+uv_groups = ["train"]                # optional; passed to uv sync/run as --group
+uv_all_extras = false                # optional; passed to uv sync/run as --all-extras
+download_outputs = true              # optional; set false to skip outputs/ download
+download_include = ["outputs/**/best/**", "outputs/**/*.json"]
+download_exclude = ["outputs/**/checkpoint-*/*.pt"]
 ssh_max_wait = 300                   # optional; SSH connect budget (seconds)
 ssh_retry_delay = 5                  # optional; delay between SSH retries (seconds)
+ssh_auth_timeout = 90                # optional; fallback to next provider after auth stalls
 exclude_providers = ["massedcompute"]  # optional; skip providers when picking cheapest GPU
 ```
 
@@ -84,7 +91,7 @@ primejob dataset push ./data
 primejob dataset list
 
 # 3. Run training. Auto-picks cheapest matching GPU, uploads src
-#    (respects .gitignore), runs `uv sync` + `uv run python train.py`,
+#    (respects .gitignore), runs `uv sync` + `uv run python -u train.py`,
 #    streams output, downloads outputs/ when done, terminates pod.
 #    Opens a Textual dashboard in a TTY; falls back to plain streaming
 #    in CI / pipes. Pass --plain to force plain mode.
@@ -133,7 +140,7 @@ primejob run train.py --disk my-project-data --data-mode stage
 primejob run train.py --gpu H100 --data-mode none --yes
 
 # Bundle local data into the src tarball (even if gitignored).
-primejob run train.py --gpu H100 --data-mode local --include-data ./data --yes
+primejob run train.py --gpu H100 --data-mode local --include ./data --yes
 ```
 
 `attach` is fastest for one job: Prime mounts the persistent disk directly and `PRIMEJOB_DATASET_PATH` points at that mount. The disk must be compatible with the selected provider/location, and Prime currently treats it as an exclusive attachment: concurrent runs on the same disk can fail with `Disk ... is already used`. primejob filters GPU availability by `disks=[disk_id]` in this mode and waits for the disk to detach after termination before finishing the run.
@@ -142,7 +149,7 @@ primejob run train.py --gpu H100 --data-mode local --include-data ./data --yes
 
 `none` skips persistent disks entirely — ignores `[tool.primejob].dataset_disk` and does not set `PRIMEJOB_DATASET_PATH`. Use this on providers where disk create returns errors (e.g. some Nebius / Crusoe regions) or when your script loads data from Hugging Face Hub.
 
-`local` bundles paths from `--include-data` and/or `[tool.primejob].bundle_paths` into the uploaded src tarball, even when those paths are gitignored. After upload, `PRIMEJOB_DATASET_PATH` points at the bundled directory under `/tmp/primejob/work/`.
+`local` bundles paths from `--include` and/or `[tool.primejob].include` into the uploaded src tarball, even when those paths are gitignored. `--include-data` and `[tool.primejob].bundle_paths` still work as deprecated aliases. After upload, `PRIMEJOB_DATASET_PATH` points at the bundled directory under `/tmp/primejob/work/`.
 
 ## What primejob does for you on each run
 
@@ -152,7 +159,7 @@ primejob run train.py --gpu H100 --data-mode local --include-data ./data --yes
 4. Creates the persistent disk if missing, in the cheapest region matching country.
 5. Handles the dataset according to `--data-mode`: attach the disk directly, or stage a copy first.
 6. Tarballs your project src honoring `.gitignore` and defaults (`.git/`, `outputs/`, `.env`, `.venv/`, `__pycache__/`, etc.) — uploads via SFTP.
-7. Runs `uv sync` then `uv run python <script>` over a streaming SSH channel — stdout/stderr to your terminal AND to `~/.primejob/runs/<run_id>/log.txt`.
+7. Runs `uv sync` then `uv run python -u <script>` over a streaming SSH channel — stdout/stderr to your terminal AND to `~/.primejob/runs/<run_id>/log.txt`.
 8. Background status bar every 30s: `[run_id] elapsed=12m34s rate=$2.43/h spent=$0.51`.
 9. On exit (success, failure, or `Ctrl+C`): downloads `outputs/` back to `./outputs/<run_id>/`, terminates the pod, waits for attached disks to detach, writes a run manifest.
 

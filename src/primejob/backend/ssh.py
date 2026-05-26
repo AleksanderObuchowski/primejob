@@ -12,6 +12,7 @@ import re
 import shlex
 import stat
 import time
+from fnmatch import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
@@ -21,6 +22,10 @@ import paramiko
 
 class SshRetryDetailCallback(Protocol):
     def __call__(self, attempt: int, total: int, delay_s: float, detail: str) -> None: ...
+
+
+class SshAuthPropagationTimeout(RuntimeError):
+    """SSH key auth kept failing long enough to try another provider."""
 
 
 @dataclass
@@ -93,6 +98,7 @@ def wait_for_ssh_connect(
     pod_ready_monotonic: float | None = None,
     on_retry: SshRetryDetailCallback | None = None,
     auth_failure_hint: str | None = None,
+    auth_timeout_s: float | None = None,
 ) -> paramiko.SSHClient:
     """Block until SSH accepts our key or timeouts expire.
 
@@ -126,6 +132,11 @@ def wait_for_ssh_connect(
         except paramiko.AuthenticationException as e:
             last_exc = e
             elapsed_pod = time.monotonic() - pod_start
+            if auth_timeout_s is not None and elapsed_pod >= auth_timeout_s:
+                raise SshAuthPropagationTimeout(
+                    "SSH authentication kept failing during key propagation "
+                    f"for ~{elapsed_pod:.0f}s."
+                ) from e
             if elapsed_pod < auth_warmup_s:
                 detail = "auth_propagation"
             else:
@@ -351,34 +362,72 @@ class SshClient:
         local_path: str | Path,
         *,
         ignore_permission_denied: bool = False,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+        match_root_name: str | None = None,
     ) -> None:
         """Recursive download. If remote is a directory, mirror it into local."""
-        local = Path(local_path)
+        self._download(
+            remote_path,
+            Path(local_path),
+            ignore_permission_denied=ignore_permission_denied,
+            include_patterns=include_patterns or [],
+            exclude_patterns=exclude_patterns or [],
+            match_root_name=match_root_name,
+            rel_path="",
+        )
+
+    def _download(
+        self,
+        remote_path: str,
+        local: Path,
+        *,
+        ignore_permission_denied: bool,
+        include_patterns: list[str],
+        exclude_patterns: list[str],
+        match_root_name: str | None,
+        rel_path: str,
+    ) -> bool:
         try:
             st = self.sftp.stat(remote_path)
         except PermissionError:
             if ignore_permission_denied:
-                return
+                return False
             raise
         except FileNotFoundError:
-            return
+            return False
         if stat.S_ISDIR(st.st_mode):
-            local.mkdir(parents=True, exist_ok=True)
             try:
                 entries = self.sftp.listdir_attr(remote_path)
             except PermissionError:
                 if ignore_permission_denied:
-                    return
+                    return False
                 raise
+            downloaded = False
             for entry in entries:
-                self.download(
+                child_rel = (
+                    f"{rel_path}/{entry.filename}" if rel_path else entry.filename
+                )
+                child_downloaded = self._download(
                     posixpath.join(remote_path, entry.filename),
                     local / entry.filename,
                     ignore_permission_denied=ignore_permission_denied,
+                    include_patterns=include_patterns,
+                    exclude_patterns=exclude_patterns,
+                    match_root_name=match_root_name,
+                    rel_path=child_rel,
                 )
+                downloaded = downloaded or child_downloaded
+            if downloaded or not include_patterns and not exclude_patterns:
+                local.mkdir(parents=True, exist_ok=True)
+            return downloaded
         else:
+            match_path = _download_match_path(rel_path, match_root_name)
+            if not _download_path_selected(match_path, include_patterns, exclude_patterns):
+                return False
             local.parent.mkdir(parents=True, exist_ok=True)
             self.sftp.get(remote_path, str(local))
+            return True
 
 
 def exec_oneshot(endpoint: SshEndpoint, cmd: str, *, timeout: float = 10.0) -> ExecResult:
@@ -402,3 +451,17 @@ def _with_env_prefix(cmd: str, env: dict[str, str] | None) -> str:
         return cmd
     exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items())
     return f"env {exports} sh -c {shlex.quote(cmd)}"
+
+
+def _download_match_path(rel_path: str, root_name: str | None) -> str:
+    return f"{root_name}/{rel_path}" if root_name and rel_path else rel_path
+
+
+def _download_path_selected(
+    rel_path: str,
+    include_patterns: list[str],
+    exclude_patterns: list[str],
+) -> bool:
+    included = not include_patterns or any(fnmatch(rel_path, p) for p in include_patterns)
+    excluded = any(fnmatch(rel_path, p) for p in exclude_patterns)
+    return included and not excluded

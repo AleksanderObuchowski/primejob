@@ -320,10 +320,16 @@ def run(
         "--data-subdir",
         help="Subdirectory on the dataset disk to stage (only with --data-mode stage).",
     ),
+    include: list[str] = typer.Option(
+        [],
+        "--include",
+        "-i",
+        help="Local path to bundle into the src tarball (repeatable; used with --data-mode local).",
+    ),
     include_data: list[str] = typer.Option(
         [],
         "--include-data",
-        help="Local path to bundle into the src tarball (repeatable; used with --data-mode local).",
+        help="Deprecated alias for --include.",
     ),
     setup_ssh: bool = typer.Option(
         False,
@@ -334,6 +340,41 @@ def run(
         [],
         "--skip-provider",
         help="Exclude provider from cheapest-pick (repeatable). Also see exclude_providers in pyproject.toml.",
+    ),
+    uv_extra: list[str] = typer.Option(
+        [],
+        "--extra",
+        help="Install and run with a uv optional dependency extra (repeatable).",
+    ),
+    uv_group: list[str] = typer.Option(
+        [],
+        "--group",
+        help="Install and run with a uv dependency group (repeatable).",
+    ),
+    uv_all_extras: bool = typer.Option(
+        False,
+        "--all-extras",
+        help="Install and run with all uv optional dependency extras.",
+    ),
+    download_include: list[str] = typer.Option(
+        [],
+        "--download-include",
+        help="Only download outputs/ paths matching this glob (repeatable).",
+    ),
+    download_exclude: list[str] = typer.Option(
+        [],
+        "--download-exclude",
+        help="Skip outputs/ paths matching this glob (repeatable).",
+    ),
+    no_download: bool = typer.Option(
+        False,
+        "--no-download",
+        help="Skip downloading outputs/ after the remote process exits.",
+    ),
+    ssh_auth_timeout: float | None = typer.Option(
+        None,
+        "--ssh-auth-timeout",
+        help="Seconds of SSH auth-propagation failures before trying the next provider.",
     ),
     plain: bool = typer.Option(False, "--plain", help="Force plain streaming output (no TUI)."),
     exit_on_finish: bool = typer.Option(False, "--exit-on-finish", help="In TUI mode, skip summary screen and exit immediately."),
@@ -347,6 +388,9 @@ def run(
     """
     from primejob.run import RunAborted, RunOptions, run_training
 
+    if include_data:
+        console.print("[yellow]Warning:[/yellow] --include-data is deprecated; use --include.")
+
     opts = RunOptions(
         script=script,
         args=list(ctx.args),
@@ -358,9 +402,17 @@ def run(
         disk_size_gb=disk_size,
         data_mode=data_mode,
         data_subdir=data_subdir,
+        include=include,
         include_data=include_data,
         setup_ssh=setup_ssh,
         skip_providers=skip_provider,
+        uv_extras=uv_extra,
+        uv_groups=uv_group,
+        uv_all_extras=uv_all_extras,
+        download_include=download_include,
+        download_exclude=download_exclude,
+        no_download=no_download,
+        ssh_auth_timeout=ssh_auth_timeout,
     )
 
     use_tui = sys.stdout.isatty() and not plain
