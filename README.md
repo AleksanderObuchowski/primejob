@@ -70,11 +70,13 @@ forward_env  = ["HF_TOKEN", "WANDB_API_KEY"]
 default_gpu  = "H200"                # short alias — resolved to H200_141GB
 default_country = "US"               # optional; biases pod placement
 default_disk_size = 50               # GB, used when creating the disk fresh
-bundle_paths = ["data/"]             # optional; used with --data-mode local
+include      = ["data/train.jsonl", "configs/*.yaml"]  # extra files to ship (see Packaging)
 ssh_max_wait = 300                   # optional; SSH connect budget (seconds)
 ssh_retry_delay = 5                  # optional; delay between SSH retries (seconds)
 exclude_providers = ["massedcompute"]  # optional; skip providers when picking cheapest GPU
 ```
+
+`bundle_paths` from older configs is still accepted as an alias for `include`; the first run prints a one-time rename hint and the values are merged in.
 
 ## Quickstart
 
@@ -98,7 +100,31 @@ primejob status <run_id>
 primejob logs   <run_id>
 primejob attach <run_id>      # re-open dashboard (view-only)
 primejob terminate <run_id>   # safety net if a run wedged
+primejob runs list --check-remote   # flag runs that may still be billing
+primejob runs reconcile             # detect stale local "running" manifests
+primejob runs reconcile --terminate-stale   # stop billing on stale pods
 ```
+
+### Pod lifecycle safety
+
+`primejob run` owns the pod for the lifetime of the command. A detached local **watchdog** terminates the pod if the foreground process dies (`kill -9`, terminal closed, parent harness exit) while the machine is still up.
+
+- **Graceful exit** (`Ctrl+C`, errors, normal finish): cleanup terminates the pod and finalizes `~/.primejob/runs/<run_id>/manifest.json`.
+- **Abrupt local death**: the watchdog detects a dead parent PID or stale lease heartbeat and terminates the pod.
+- **Recovery**: `primejob runs list --check-remote`, `primejob runs reconcile`, and `primejob terminate <run_id>` surface and fix stale `running` manifests.
+
+**Manual repro (kill -9):**
+
+```bash
+primejob run train.py --gpu <small_gpu> --yes --plain
+# After "SSH connected" / pod_id is in manifest:
+kill -9 <primejob_pid>
+# Within ~5s the watchdog should terminate the pod; manifest status → terminated.
+prime pods list
+primejob status <run_id>
+```
+
+A host crash or OOM that kills both the CLI and watchdog cannot be covered locally; use `primejob runs reconcile` when you return.
 
 ### Dashboard keybindings (TTY mode)
 
@@ -135,7 +161,7 @@ primejob run train.py --disk my-project-data --data-mode stage
 primejob run train.py --gpu H100 --data-mode none --yes
 
 # Bundle local data into the src tarball (even if gitignored).
-primejob run train.py --gpu H100 --data-mode local --include-data ./data --yes
+primejob run train.py --gpu H100 --data-mode local --include-data data/train.jsonl --yes
 ```
 
 `attach` is fastest for one job: Prime mounts the persistent disk directly and `PRIMEJOB_DATASET_PATH` points at that mount. The disk must be compatible with the selected provider/location, and Prime currently treats it as an exclusive attachment: concurrent runs on the same disk can fail with `Disk ... is already used`. primejob filters GPU availability by `disks=[disk_id]` in this mode and waits for the disk to detach after termination before finishing the run.
@@ -144,7 +170,42 @@ primejob run train.py --gpu H100 --data-mode local --include-data ./data --yes
 
 `none` skips persistent disks entirely — ignores `[tool.primejob].dataset_disk` and does not set `PRIMEJOB_DATASET_PATH`. Use this on providers where disk create returns errors (e.g. some Nebius / Crusoe regions) or when your script loads data from Hugging Face Hub.
 
-`local` bundles paths from `--include-data` and/or `[tool.primejob].bundle_paths` into the uploaded src tarball, even when those paths are gitignored. After upload, `PRIMEJOB_DATASET_PATH` points at the bundled directory under `/tmp/primejob/work/`.
+`local` bundles paths from `--include-data` and/or `[tool.primejob].include` into the uploaded src tarball, even when those paths are gitignored. The same patterns are used for the broader **Packaging** flow below — `--data-mode local` just additionally exposes them through `PRIMEJOB_DATASET_PATH`, which points at the first bundled directory under `/tmp/primejob/work/`.
+
+## Packaging
+
+primejob figures out what to ship to the pod by reading your entrypoint, not by uploading the entire working directory. Each `primejob run` (and `primejob package`) builds a `PackagePlan` from three sources:
+
+1. **AST import closure.** Static analysis of `train.py` walks every local `import`, follows them recursively, and adds the files behind them. Third-party packages and the stdlib are skipped (they come from `uv sync` on the pod). Both flat layouts (`src/data.py`) and src-layouts (`src/<pkg>/...`) work without extra config.
+2. **Always-include manifest.** `pyproject.toml`, `uv.lock`, `.python-version`, and top-level `README*` / `LICENSE*` files are added if present so `uv sync` has what it needs.
+3. **Explicit `include` patterns.** Anything matching `[tool.primejob].include` (or `--include`/`--include-data` on the CLI) is added — globs (`configs/*.yaml`), directory shorthand (`data/`), and double-star (`runs/**/manifest.json`) are all supported. This is where data files belong.
+
+A small `DEFAULT_EXCLUDES` safety belt prunes `.git/`, `.venv/`, `.uv-cache/`, `node_modules/`, `__pycache__/`, `outputs/`, `.env`, and similar caches before they ever reach the tarball.
+
+Dynamic imports (`importlib.import_module`, `__import__`) cannot be resolved statically. primejob reports them and, in a TTY, asks once whether to add them to your `include` list; in `--yes` / non-interactive mode they become a warning and the run continues.
+
+If the tarball ends up above 100 MB, primejob prints the five largest files so you can spot the runaway directory and tighten your patterns.
+
+### Previewing what gets shipped
+
+Use the dry-run command to inspect the plan before any pod is created:
+
+```bash
+primejob package train.py --dry-run
+# Packaging plan for train.py
+#   Python imports (AST closure) (3)
+#     train.py
+#     src/__init__.py
+#     src/data.py
+#   Always included (2)
+#     pyproject.toml
+#     uv.lock
+#   Explicit include (1)
+#     data/train.jsonl
+#   Total: 6 files, 0.2 MB (uncompressed)
+```
+
+Drop `--dry-run` to write the tarball to disk (`./primejob-package.tar.gz` by default, or `-o path.tar.gz`). Add `--include / -i pattern` to test extra patterns without editing `pyproject.toml`.
 
 ## What primejob does for you on each run
 
@@ -153,7 +214,7 @@ primejob run train.py --gpu H100 --data-mode local --include-data ./data --yes
 3. Asks once for cost confirmation (skip with `--yes`).
 4. Creates the persistent disk if missing, in the cheapest region matching country.
 5. Handles the dataset according to `--data-mode`: attach the disk directly, or stage a copy first.
-6. Tarballs your project src honoring `.gitignore` and defaults (`.git/`, `outputs/`, `.env`, `.venv/`, `__pycache__/`, etc.) — uploads via SFTP.
+6. Builds the src tarball from your entrypoint's AST closure + always-include manifest + `[tool.primejob].include` patterns (see **Packaging**), then uploads via SFTP with progress.
 7. Runs `uv sync` then `uv run python <script>` over a streaming SSH channel — stdout/stderr to your terminal AND to `~/.primejob/runs/<run_id>/log.txt`.
 8. Background status bar every 30s: `[run_id] elapsed=12m34s rate=$2.43/h spent=$0.51`.
 9. On exit (success, failure, or `Ctrl+C`): downloads `outputs/` back to `./outputs/<run_id>/`, terminates the pod, waits for attached disks to detach, writes a run manifest.

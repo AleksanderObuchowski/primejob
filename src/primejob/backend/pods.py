@@ -16,6 +16,14 @@ FAILED_STATES = {"failed", "error", "terminated"}
 
 
 @dataclass
+class TerminateResult:
+    """Outcome of a pod terminate API call."""
+
+    success: bool
+    error: str | None = None
+
+
+@dataclass
 class PodSpec:
     name: str
     gpu_option: GpuOption
@@ -137,9 +145,13 @@ def wait_for_running(
         time.sleep(poll_interval)
 
 
-def terminate(client: APIClient, pod_id: str) -> None:
-    """Best-effort terminate — swallow errors (pod may already be gone)."""
-    delete_pod(client, pod_id)
+def terminate_pod(client: APIClient, pod_id: str) -> TerminateResult:
+    """Terminate a pod and return whether the API call succeeded."""
+    try:
+        PodsClient(client).delete(pod_id)
+        return TerminateResult(success=True)
+    except Exception as e:  # noqa: BLE001
+        return TerminateResult(success=False, error=str(e))
 
 
 def delete_pod(client: APIClient, pod_id: str) -> bool:
@@ -151,11 +163,12 @@ def delete_pod(client: APIClient, pod_id: str) -> bool:
     Prefer :func:`terminate` for automated cleanup paths that must not leak
     diagnostics; use :func:`delete_pod` when the CLI needs to react to failures.
     """
-    try:
-        PodsClient(client).delete(pod_id)
-        return True
-    except Exception:  # noqa: BLE001
-        return False
+    return terminate_pod(client, pod_id).success
+
+
+def terminate(client: APIClient, pod_id: str) -> None:
+    """Best-effort terminate — swallow errors (pod may already be gone)."""
+    delete_pod(client, pod_id)
 
 
 def mount_path_for_disk(pod: Pod, disk_id: str) -> str | None:
