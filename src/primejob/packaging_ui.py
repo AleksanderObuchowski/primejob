@@ -82,12 +82,12 @@ def warn_once(
 def resolve_include_patterns(
     cli_includes: list[str], project_includes: list[str]
 ) -> list[str]:
-    """Merge --include-data flags with [tool.primejob].include.
+    """Merge CLI include flags with [tool.primejob].include.
 
-    CLI patterns come first so users can override config order; duplicates
-    are dropped while preserving first-seen position.
+    Project config comes first so required files in pyproject.toml are not
+    accidentally dropped when a user adds one more path on the CLI.
     """
-    return dedupe_preserve_order(cli_includes, project_includes)
+    return dedupe_preserve_order(project_includes, cli_includes)
 
 
 # ---------------------------------------------------------------------------
