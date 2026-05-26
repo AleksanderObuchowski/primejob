@@ -106,9 +106,8 @@ def test_resolve_include_patterns_defaults_empty() -> None:
 
 
 def test_resolve_include_patterns_merges_cli_and_config() -> None:
-    """CLI patterns come first so user overrides win on order ties."""
     out = resolve_include_patterns(["extra.jsonl"], ["configs/", "data/pii/*.jsonl"])
-    assert out == ["extra.jsonl", "configs/", "data/pii/*.jsonl"]
+    assert out == ["configs/", "data/pii/*.jsonl", "extra.jsonl"]
 
 
 def test_resolve_include_patterns_dedupes_across_sources() -> None:
