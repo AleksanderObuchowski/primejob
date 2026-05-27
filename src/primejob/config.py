@@ -40,6 +40,15 @@ class ProjectConfig:
     download_outputs: bool = True
     download_include: list[str] = field(default_factory=list)
     download_exclude: list[str] = field(default_factory=list)
+    # Regex patterns that flag a remote stdout/stderr line as an "error" worth
+    # surfacing in the final summary. Empty = use built-in default patterns.
+    error_patterns: list[str] = field(default_factory=list)
+    # Wall-clock timeouts (seconds) for remote commands run via SSH. None
+    # disables the timeout. uv_install/uv_sync default to bounded values so
+    # a stuck dependency resolver doesn't bill GPU hours indefinitely.
+    uv_install_timeout: float | None = 600.0   # 10 min
+    uv_sync_timeout: float | None = 1800.0     # 30 min
+    uv_run_timeout: float | None = None        # training may be long-running
 
 
 def find_pyproject(start: Path) -> Path | None:
@@ -82,7 +91,22 @@ def load_project_config(cwd: Path | None = None) -> ProjectConfig:
         download_outputs=bool(section.get("download_outputs", True)),
         download_include=list(section.get("download_include", [])),
         download_exclude=list(section.get("download_exclude", [])),
+        error_patterns=list(section.get("error_patterns", [])),
+        uv_install_timeout=_parse_optional_float(section.get("uv_install_timeout", 600.0)),
+        uv_sync_timeout=_parse_optional_float(section.get("uv_sync_timeout", 1800.0)),
+        uv_run_timeout=_parse_optional_float(section.get("uv_run_timeout", None)),
     )
+
+
+def _parse_optional_float(value) -> float | None:
+    """Parse an optional float from a TOML value (None / number / string)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value.strip() or value.strip().lower() in {"none", "null", "off", "0"}:
+            return None
+        return float(value)
+    return float(value)
 
 
 def effective_gpu_count(cli_count: int | None, cfg: ProjectConfig) -> int:

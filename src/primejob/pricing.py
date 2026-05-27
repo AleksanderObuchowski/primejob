@@ -11,6 +11,8 @@ from typing import Iterable
 from prime_cli.api.availability import AvailabilityClient
 from prime_cli.api.client import APIClient
 
+from primejob._retry import with_retry
+
 
 GPU_ALIASES: dict[str, str] = {
     "H100": "H100_80GB",
@@ -130,10 +132,12 @@ def list_gpus(
     # Note: API's `regions` param wants macroregion names (united_states,
     # eu_west, etc.), not ISO country codes — we filter by ISO country
     # client-side after the response.
-    raw = av.get(
-        gpu_count=gpu_count,
-        gpu_type=resolved,
-        disks=disks,
+    raw = with_retry(
+        lambda: av.get(
+            gpu_count=gpu_count,
+            gpu_type=resolved,
+            disks=disks,
+        )
     )
     out: list[GpuOption] = []
     for items in raw.values():
@@ -182,4 +186,4 @@ def pick_cheapest(
 
 
 def available_gpu_types(client: APIClient) -> list[str]:
-    return AvailabilityClient(client).get_available_gpu_types()
+    return with_retry(lambda: AvailabilityClient(client).get_available_gpu_types())

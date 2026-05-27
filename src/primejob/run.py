@@ -343,6 +343,7 @@ def run_training(
     tracker = CostTracker(rate_per_hr=rate)
     error_lines: list[str] = []
     failed_phase: Phase | None = None
+    error_pattern = _compile_error_patterns(project.error_patterns)
     heartbeat_stop = threading.Event()
 
     def _heartbeat_loop() -> None:
@@ -594,14 +595,22 @@ def run_training(
                 env = _build_remote_env(cwd, project.forward_env)
 
                 sink.status("Uploading src tarball...")
+
+                def _upload_retry(attempt: int, total: int, delay_s: float, detail: str) -> None:
+                    sink.status_note(
+                        f"  upload retry {attempt}/{total} in {delay_s:.0f}s ({detail})"
+                    )
+
                 try:
                     sh.upload(
                         tarball,
                         REMOTE_TARBALL,
                         progress=make_upload_progress(sink, tar.bytes_size),
+                        on_retry=_upload_retry,
                     )
                     sh.exec(
-                        f"mkdir -p {REMOTE_WORK} && tar -xzf {REMOTE_TARBALL} -C {REMOTE_WORK} && rm -f {REMOTE_TARBALL}"
+                        f"mkdir -p {REMOTE_WORK} && tar -xzf {REMOTE_TARBALL} -C {REMOTE_WORK} && rm -f {REMOTE_TARBALL}",
+                        timeout=300.0,
                     ).check()
                 except Exception:
                     failed_phase = Phase.UPLOAD
@@ -630,7 +639,9 @@ def run_training(
 
                 sink.phase(Phase.INSTALL)
                 sink.status("Installing uv on the pod...")
-                install = sh.exec(_build_uv_install_cmd())
+                install = sh.exec(
+                    _build_uv_install_cmd(), timeout=project.uv_install_timeout
+                )
                 if install.exit_code != 0:
                     for line in install.stdout.splitlines():
                         sink.log_line("stderr", line)
@@ -642,7 +653,9 @@ def run_training(
                     raise RuntimeError(f"uv install failed (exit={install.exit_code})")
 
                 sink.status("Running `uv sync`...")
-                sync = sh.exec(_build_uv_sync_cmd(uv_args))
+                sync = sh.exec(
+                    _build_uv_sync_cmd(uv_args), timeout=project.uv_sync_timeout
+                )
                 if sync.exit_code != 0:
                     for line in sync.stdout.splitlines():
                         sink.log_line("stderr", line)
@@ -661,10 +674,15 @@ def run_training(
 
                 def on_line(stream: str, line: str) -> None:
                     sink.log_line(stream, line)
-                    if _is_error_line(line):
+                    if _is_error_line(line, patterns=error_pattern):
                         error_lines.append(line)
 
-                exit_code = sh.exec_stream(remote_cmd, env=env, on_line=on_line)
+                exit_code = sh.exec_stream(
+                    remote_cmd,
+                    env=env,
+                    on_line=on_line,
+                    timeout=project.uv_run_timeout,
+                )
                 record.exit_code = exit_code
 
                 sink.phase(Phase.WRAP)
@@ -848,11 +866,30 @@ def _build_remote_env(cwd: Path, forward: list[str]) -> dict[str, str]:
     return out
 
 
-_ERR_PATTERNS = re.compile(
-    r"\b(Error|Exception|Traceback|FAILED|OOM|CUDA out of memory)\b",
-    re.IGNORECASE,
+# Default patterns tuned to catch real failures while skipping the noisy
+# "WARN: deprecation Error in module X" / "Retrying after error" lines that
+# show up in healthy transformers/urllib3 runs.
+_DEFAULT_ERR_PATTERNS: tuple[str, ...] = (
+    r"^Traceback ",                       # Python tracebacks start here
+    r"^\s*File \".+\", line \d+,",         # Continuation frame
+    r"^[A-Z]\w*(?:Error|Exception):",      # `RuntimeError: ...`, `ValueError: ...`
+    r"\bCUDA(?:[\w ]*?)(?:error|fatal)\b", # CUDA error/CUDA fatal (case-insensitive below)
+    r"\bout of memory\b",                  # OOM (covers CUDA OOM + torch OOM)
+    r"\bCalledProcessError\b",
+    r"\bAssertionError\b",
+    r"\bSegmentation fault\b",
+    r"^FAILED\b",                          # pytest summary
+    r"^E\s+\w+:",                          # pytest individual failure marker
 )
 
 
-def _is_error_line(line: str) -> bool:
-    return bool(_ERR_PATTERNS.search(line))
+def _compile_error_patterns(extra: list[str] | None = None) -> re.Pattern[str]:
+    patterns = list(_DEFAULT_ERR_PATTERNS) + list(extra or [])
+    return re.compile("|".join(f"(?:{p})" for p in patterns), re.IGNORECASE)
+
+
+_ERR_PATTERNS = _compile_error_patterns()
+
+
+def _is_error_line(line: str, *, patterns: re.Pattern[str] | None = None) -> bool:
+    return bool((patterns or _ERR_PATTERNS).search(line))

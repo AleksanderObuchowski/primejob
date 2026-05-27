@@ -11,10 +11,13 @@ Two implementations:
 """
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Protocol
+
+from primejob._atomic import secure_chmod
 
 if TYPE_CHECKING:
     from primejob.backend.ssh import SshEndpoint
@@ -74,6 +77,17 @@ class ConsoleSink:
         self._yes = yes
         if log_file is not None:
             log_file.parent.mkdir(parents=True, exist_ok=True)
+            # Create the file (if missing) with restrictive perms BEFORE we
+            # append — remote stdout may contain forwarded secrets.
+            if not log_file.exists():
+                fd = os.open(
+                    str(log_file),
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    0o600,
+                )
+                os.close(fd)
+            else:
+                secure_chmod(log_file, 0o600)
             self._fh = log_file.open("a", encoding="utf-8")
 
     # ------------------------------------------------------------ EventSink
