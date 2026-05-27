@@ -868,18 +868,20 @@ def _build_remote_env(cwd: Path, forward: list[str]) -> dict[str, str]:
 
 # Default patterns tuned to catch real failures while skipping the noisy
 # "WARN: deprecation Error in module X" / "Retrying after error" lines that
-# show up in healthy transformers/urllib3 runs.
+# show up in healthy transformers/urllib3 runs. Two key tricks:
+#   1. Require a trailing `:` after Error/Exception — kills "deprecation Error in module".
+#   2. Inline `(?-i:...)` forces the exception-name match to be case-sensitive
+#      even though the rest of the alternation is case-insensitive — kills
+#      lowercase "error:" in lines like "Retrying after error: connection reset".
 _DEFAULT_ERR_PATTERNS: tuple[str, ...] = (
-    r"^Traceback ",                       # Python tracebacks start here
-    r"^\s*File \".+\", line \d+,",         # Continuation frame
-    r"^[A-Z]\w*(?:Error|Exception):",      # `RuntimeError: ...`, `ValueError: ...`
-    r"\bCUDA(?:[\w ]*?)(?:error|fatal)\b", # CUDA error/CUDA fatal (case-insensitive below)
-    r"\bout of memory\b",                  # OOM (covers CUDA OOM + torch OOM)
-    r"\bCalledProcessError\b",
-    r"\bAssertionError\b",
+    r"^Traceback ",                              # Python tracebacks start here
+    r"^\s*File \".+\", line \d+,",                # Continuation frame
+    r"(?-i:\b[A-Z]\w*(?:Error|Exception)):",      # `RuntimeError:`, `torch.cuda.OutOfMemoryError:`
+    r"\bCUDA(?:[\w ]*?)(?:error|fatal)\b",         # CUDA error / CUDA fatal
+    r"\bout of memory\b",                          # OOM
     r"\bSegmentation fault\b",
-    r"^FAILED\b",                          # pytest summary
-    r"^E\s+\w+:",                          # pytest individual failure marker
+    r"^FAILED\b",                                  # pytest summary
+    r"^E\s+\w+:",                                  # pytest individual failure marker
 )
 
 
