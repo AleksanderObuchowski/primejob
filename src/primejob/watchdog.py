@@ -9,6 +9,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from primejob._atomic import atomic_write_text
 from primejob.state import RUNS_DIR, RunRecord, load_run
 
 LEASE_FILENAME = "lease.json"
@@ -46,8 +47,7 @@ def read_lease(run_id: str) -> Lease | None:
 
 
 def _write_lease(lease: Lease) -> None:
-    lease.path.parent.mkdir(parents=True, exist_ok=True)
-    lease.path.write_text(json.dumps(asdict(lease), indent=2))
+    atomic_write_text(lease.path, json.dumps(asdict(lease), indent=2), mode=0o600)
 
 
 def create_lease(run_id: str, pod_id: str, *, parent_pid: int | None = None) -> Lease:

@@ -54,10 +54,10 @@ class FakeSshClient:
     def upload(self, local_path, remote_path, **kwargs) -> None:
         pass
 
-    def exec(self, cmd: str) -> ExecResult:
+    def exec(self, cmd: str, *, env=None, timeout=None) -> ExecResult:
         return ExecResult(exit_code=0, stdout="", stderr="")
 
-    def exec_stream(self, cmd: str, *, env=None, on_line=None) -> int:
+    def exec_stream(self, cmd: str, *, env=None, on_line=None, timeout=None) -> int:
         return 0
 
     def download(self, *args, **kwargs) -> None:

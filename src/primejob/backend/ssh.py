@@ -10,6 +10,7 @@ import os
 import posixpath
 import re
 import shlex
+import socket
 import stat
 import time
 from fnmatch import fnmatch
@@ -188,6 +189,10 @@ class ExecResult:
         return self
 
 
+class RemoteTimeout(RuntimeError):
+    """Remote command exceeded the configured timeout."""
+
+
 class SshClient:
     """Context-managed paramiko SSH client with SFTP helpers."""
 
@@ -209,6 +214,7 @@ class SshClient:
         self._prec_connected = prec_connected
         self._client: paramiko.SSHClient | None = None
         self._sftp: paramiko.SFTPClient | None = None
+        self._known_dirs: set[str] = set()
 
     def __enter__(self) -> "SshClient":
         self.connect(on_retry=self.on_retry)
@@ -277,26 +283,17 @@ class SshClient:
             self._sftp = self._require().open_sftp()
         return self._sftp
 
-    def exec(self, cmd: str, *, env: dict[str, str] | None = None) -> ExecResult:
-        """Run a command, return (exit_code, stdout, stderr) when done."""
-        full_cmd = _with_env_prefix(cmd, env)
-        stdin, stdout, stderr = self._require().exec_command(full_cmd, get_pty=False)
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        code = stdout.channel.recv_exit_status()
-        return ExecResult(exit_code=code, stdout=out, stderr=err)
-
-    def exec_stream(
+    def exec(
         self,
         cmd: str,
         *,
         env: dict[str, str] | None = None,
-        on_line: Callable[[str, str], None] | None = None,
-    ) -> int:
-        """Run a command and stream stdout/stderr line-by-line via callback.
+        timeout: float | None = None,
+    ) -> ExecResult:
+        """Run a command, return (exit_code, stdout, stderr) when done.
 
-        on_line(stream_name, line) — stream_name in {'stdout', 'stderr'}.
-        Returns the remote exit code.
+        `timeout` is wall-clock seconds; on expiry the channel is closed and
+        RemoteTimeout is raised. None disables the timeout (legacy behavior).
         """
         full_cmd = _with_env_prefix(cmd, env)
         transport = self._require().get_transport()
@@ -306,35 +303,101 @@ class SshClient:
         chan.exec_command(full_cmd)
         chan.set_combine_stderr(False)
 
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
         stdout_buf = b""
         stderr_buf = b""
-        while True:
-            done = chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready()
-            if chan.recv_ready():
-                stdout_buf += chan.recv(65536)
-                stdout_buf = _emit_lines(stdout_buf, "stdout", on_line)
-            if chan.recv_stderr_ready():
-                stderr_buf += chan.recv_stderr(65536)
-                stderr_buf = _emit_lines(stderr_buf, "stderr", on_line)
-            if done:
-                break
-            time.sleep(0.05)
-        # flush trailing partials
-        if stdout_buf and on_line:
-            on_line("stdout", stdout_buf.decode("utf-8", errors="replace"))
-        if stderr_buf and on_line:
-            on_line("stderr", stderr_buf.decode("utf-8", errors="replace"))
-        return chan.recv_exit_status()
+        try:
+            while True:
+                if deadline is not None and time.monotonic() > deadline:
+                    raise RemoteTimeout(
+                        f"Remote command exceeded {timeout:.0f}s timeout: {cmd!r}"
+                    )
+                if chan.recv_ready():
+                    stdout_buf += chan.recv(65536)
+                if chan.recv_stderr_ready():
+                    stderr_buf += chan.recv_stderr(65536)
+                if chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready():
+                    break
+                time.sleep(0.05)
+            code = chan.recv_exit_status()
+        finally:
+            try:
+                chan.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return ExecResult(
+            exit_code=code,
+            stdout=stdout_buf.decode("utf-8", errors="replace"),
+            stderr=stderr_buf.decode("utf-8", errors="replace"),
+        )
+
+    def exec_stream(
+        self,
+        cmd: str,
+        *,
+        env: dict[str, str] | None = None,
+        on_line: Callable[[str, str], None] | None = None,
+        timeout: float | None = None,
+    ) -> int:
+        """Run a command and stream stdout/stderr line-by-line via callback.
+
+        on_line(stream_name, line) — stream_name in {'stdout', 'stderr'}.
+        Returns the remote exit code.
+
+        `timeout` is wall-clock seconds; on expiry the channel is closed and
+        RemoteTimeout is raised. None disables the timeout (legacy behavior).
+        """
+        full_cmd = _with_env_prefix(cmd, env)
+        transport = self._require().get_transport()
+        if transport is None:
+            raise RuntimeError("No active SSH transport")
+        chan = transport.open_session()
+        chan.exec_command(full_cmd)
+        chan.set_combine_stderr(False)
+
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
+        stdout_buf = b""
+        stderr_buf = b""
+        try:
+            while True:
+                if deadline is not None and time.monotonic() > deadline:
+                    raise RemoteTimeout(
+                        f"Remote command exceeded {timeout:.0f}s timeout: {cmd!r}"
+                    )
+                done = chan.exit_status_ready() and not chan.recv_ready() and not chan.recv_stderr_ready()
+                if chan.recv_ready():
+                    stdout_buf += chan.recv(65536)
+                    stdout_buf = _emit_lines(stdout_buf, "stdout", on_line)
+                if chan.recv_stderr_ready():
+                    stderr_buf += chan.recv_stderr(65536)
+                    stderr_buf = _emit_lines(stderr_buf, "stderr", on_line)
+                if done:
+                    break
+                time.sleep(0.05)
+            # flush trailing partials
+            if stdout_buf and on_line:
+                on_line("stdout", stdout_buf.decode("utf-8", errors="replace"))
+            if stderr_buf and on_line:
+                on_line("stderr", stderr_buf.decode("utf-8", errors="replace"))
+            return chan.recv_exit_status()
+        finally:
+            try:
+                chan.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def mkdir_p(self, remote_path: str) -> None:
         parts = remote_path.strip("/").split("/")
         cur = ""
         for p in parts:
             cur = f"{cur}/{p}" if cur else f"/{p}"
+            if cur in self._known_dirs:
+                continue
             try:
                 self.sftp.stat(cur)
             except FileNotFoundError:
                 self.sftp.mkdir(cur)
+            self._known_dirs.add(cur)
 
     def upload(
         self,
@@ -342,15 +405,50 @@ class SshClient:
         remote_path: str,
         *,
         progress: Callable[[int, int], None] | None = None,
+        retries: int = 3,
+        retry_delay: float = 2.0,
+        on_retry: Callable[[int, int, float, str], None] | None = None,
     ) -> None:
+        """SFTP upload with retry on transient SSH/socket errors.
+
+        On retry the SFTP channel is reopened (paramiko channels don't survive
+        transport-level errors), and progress restarts from 0.
+        """
         local = Path(local_path)
         if local.is_dir():
             self._upload_dir(local, remote_path, progress=progress)
-        else:
-            parent = posixpath.dirname(remote_path)
-            if parent:
-                self.mkdir_p(parent)
-            self.sftp.put(str(local), remote_path, callback=progress)
+            return
+
+        parent = posixpath.dirname(remote_path)
+        last_exc: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                if parent:
+                    self.mkdir_p(parent)
+                self.sftp.put(str(local), remote_path, callback=progress)
+                return
+            except (paramiko.SSHException, socket.timeout, OSError, EOFError) as e:
+                last_exc = e
+                if attempt >= retries:
+                    break
+                # Drop the current SFTP channel so the retry opens a fresh one.
+                self._reset_sftp()
+                if on_retry is not None:
+                    on_retry(attempt, retries, retry_delay, str(e))
+                time.sleep(retry_delay)
+        raise RuntimeError(
+            f"SFTP upload of {local} → {remote_path} failed after {retries} attempts: {last_exc}"
+        ) from last_exc
+
+    def _reset_sftp(self) -> None:
+        if self._sftp is not None:
+            try:
+                self._sftp.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._sftp = None
+        # Cached mkdir results can survive a fresh SFTP channel as long as the
+        # underlying transport is alive; if not, mkdir_p will rebuild them lazily.
 
     def _upload_dir(self, local: Path, remote: str, progress=None) -> None:
         self.mkdir_p(remote)

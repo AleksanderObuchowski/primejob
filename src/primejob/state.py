@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+from primejob._atomic import atomic_write_text
 
 
 STATE_ROOT = Path.home() / ".primejob"
@@ -49,7 +51,11 @@ class RunRecord:
 
     def save(self) -> None:
         self.ensure_dir()
-        self.manifest_path.write_text(json.dumps(asdict(self), indent=2, default=str))
+        atomic_write_text(
+            self.manifest_path,
+            json.dumps(asdict(self), indent=2, default=str),
+            mode=0o600,
+        )
 
 
 def load_run(run_id: str) -> RunRecord:
@@ -78,8 +84,9 @@ def list_runs(limit: int = 50) -> list[RunRecord]:
 
 
 def new_run_id() -> str:
-    """ULID-like sortable timestamp + short random."""
+    """ULID-like sortable timestamp (ms-precision) + short random."""
     import secrets
 
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    # datetime.utcnow() is deprecated in 3.12; use timezone-aware now().
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")[:-3]
     return f"{ts}-{secrets.token_hex(3)}"

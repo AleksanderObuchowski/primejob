@@ -8,6 +8,8 @@ from prime_cli.api.availability import AvailabilityClient, DiskAvailability
 from prime_cli.api.client import APIClient
 from prime_cli.api.disks import Disk, DisksClient
 
+from primejob._retry import with_retry
+
 
 READY_STATES = {"active", "available", "ready"}
 PENDING_STATES = {"creating", "pending", "provisioning"}
@@ -24,7 +26,7 @@ class DiskLocation:
 
 
 def find_disk(client: APIClient, name: str) -> Disk | None:
-    page = DisksClient(client).list(limit=200)
+    page = with_retry(lambda: DisksClient(client).list(limit=200))
     for d in page.data:
         if d.name == name:
             return d
@@ -38,7 +40,7 @@ def pick_disk_region(
 ) -> DiskLocation:
     """Choose the cheapest disk region, optionally constrained to a country."""
     av = AvailabilityClient(client)
-    options: list[DiskAvailability] = av.get_disks()
+    options: list[DiskAvailability] = with_retry(av.get_disks)
     candidates = []
     for o in options:
         if country and (o.country or "").upper() != country.upper():
@@ -82,7 +84,8 @@ def ensure_disk(
         return existing
 
     loc = pick_disk_region(client, country=country)
-    disk = DisksClient(client).create(build_disk_create_payload(name=name, size_gb=size_gb, loc=loc))
+    payload = build_disk_create_payload(name=name, size_gb=size_gb, loc=loc)
+    disk = with_retry(lambda: DisksClient(client).create(payload))
     if wait:
         disk = wait_for_disk_ready(client, disk.id)
     return disk

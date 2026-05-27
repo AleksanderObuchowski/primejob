@@ -5,25 +5,41 @@ import atexit
 import signal
 import threading
 import time
-from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Callable
 
 
-@dataclass
 class CostTracker:
-    rate_per_hr: float
-    started_at: float = field(default_factory=time.monotonic)
+    """Sum spend across rate changes (e.g. provider fallback mid-run).
+
+    Each `update_rate` closes the current segment and opens a new one, so
+    `spent()` integrates rate over time piecewise instead of retroactively
+    re-pricing prior seconds at the new rate.
+    """
+
+    def __init__(self, rate_per_hr: float) -> None:
+        self.rate_per_hr = rate_per_hr
+        now = time.monotonic()
+        self.started_at = now
+        # (segment_start_monotonic, rate_per_hr)
+        self._segments: list[tuple[float, float]] = [(now, rate_per_hr)]
 
     def update_rate(self, new_rate: float) -> None:
-        # Rough: if rate changes mid-flight, we just swap; for MVP this is fine.
+        if new_rate == self.rate_per_hr:
+            return
         self.rate_per_hr = new_rate
+        self._segments.append((time.monotonic(), new_rate))
 
     def elapsed(self) -> timedelta:
         return timedelta(seconds=time.monotonic() - self.started_at)
 
     def spent(self) -> float:
-        return (self.rate_per_hr / 3600.0) * (time.monotonic() - self.started_at)
+        now = time.monotonic()
+        total = 0.0
+        for i, (seg_start, rate) in enumerate(self._segments):
+            seg_end = self._segments[i + 1][0] if i + 1 < len(self._segments) else now
+            total += (rate / 3600.0) * (seg_end - seg_start)
+        return total
 
 
 def fmt_elapsed(td: timedelta) -> str:
